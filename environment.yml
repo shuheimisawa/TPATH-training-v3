@@ -1,0 +1,27 @@
+name: glomeruli-segmentation
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pytorch=1.11
+  - torchvision=0.12
+  - cudatoolkit=11.3
+  - numpy
+  - pandas
+  - matplotlib
+  - opencv
+  - pillow
+  - albumentations
+  - pycocotools
+  - scikit-learn
+  - tqdm
+  - pyyaml
+  - ipykernel
+  - pytest
+  - jupyterlab
+  - pip
+  - pip:
+    - torch-summary
+    - tensorboard
