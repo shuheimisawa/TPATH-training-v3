@@ -1,0 +1,104 @@
+# Virtual Environments
+myenv/
+venv/
+ENV/
+env/
+.env/
+.venv/
+.python-version
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+*.pkl
+*.pt
+
+# Project-specific directories
+data/
+experiments/results/
+experiments/checkpoints/
+experiments/logs/
+tile_visualizations/
+annotation_visualizations/
+analysis_results/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+*.ipynb
+!notebooks/*.ipynb
+
+# Large files and models
+*.pth
+*.h5
+*.onnx
+*.pb
+*.pt
+*.bin
+*.tflite
+*.npz
+*.npy
+
+# Images and files that might be generated
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+*.gif
+*.svg
+*.svs
+*.ndpi
+*.json
+!experiments/configs/*.json
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.vs/
+*~
+.Trash-*
+
+# Documentation builds
+docs/_build/
+docs/site/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
