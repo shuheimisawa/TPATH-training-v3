@@ -12,10 +12,11 @@ from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
 
 from ..utils.logger import get_logger
+from ..utils.distributed import is_main_process
 from ..config.training_config import TrainingConfig
 from ..evaluation.evaluator import Evaluator
-from ..training.optimization import create_optimizer, create_lr_scheduler
-from ..training.loss import MaskRCNNLoss
+from .optimization import create_optimizer, create_lr_scheduler
+from .loss import MaskRCNNLoss
 
 
 class Trainer:
@@ -100,7 +101,7 @@ class Trainer:
                 config.class_weights.Partially_sclerotic,
                 config.class_weights.Uncertain
             ]
-            class_weights_tensor = torch.tensor(class_weights)
+            class_weights_tensor = torch.tensor(class_weights).to(self.device)
         else:
             class_weights_tensor = None
         
@@ -140,84 +141,116 @@ class Trainer:
         for callback in self.callbacks:
             callback.on_train_begin(logs)
         
-        for epoch in range(self.start_epoch, self.config.epochs):
-            # Call on_epoch_begin for callbacks
-            epoch_logs = {}
-            for callback in self.callbacks:
-                callback.on_epoch_begin(epoch, epoch_logs)
-            
-            self.logger.info(f"Epoch {epoch+1}/{self.config.epochs}")
-            
-            # Train for one epoch
-            epoch_loss = self._train_epoch(epoch)
-            
-            # Update learning rate
-            if self.lr_scheduler is not None:
-                # Store current learning rate
-                self.learning_rates.append(self.optimizer.param_groups[0]['lr'])
+        try:
+            for epoch in range(self.start_epoch, self.config.epochs):
+                # Call on_epoch_begin for callbacks
+                epoch_logs = {}
+                for callback in self.callbacks:
+                    callback.on_epoch_begin(epoch, epoch_logs)
                 
-                if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    # This scheduler needs the validation metric
-                    pass  # will be updated after validation
-                else:
-                    self.lr_scheduler.step()
-            
-            # Record train loss
-            self.train_loss_history.append(epoch_loss)
-            epoch_logs['train_loss'] = epoch_loss
-            
-            # Evaluate on validation set
-            if (epoch + 1) % self.config.eval_freq == 0:
-                val_metrics = self._validate_epoch(epoch)
-                val_map = val_metrics['mAP']
-                self.val_map_history.append(val_map)
-                epoch_logs.update(val_metrics)
-                epoch_logs['val_map'] = val_map
+                self.logger.info(f"Epoch {epoch+1}/{self.config.epochs}")
                 
-                # Update LR scheduler if it's ReduceLROnPlateau
-                if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.lr_scheduler.step(val_map)
+                # Train for one epoch
+                try:
+                    epoch_loss = self._train_epoch(epoch)
+                except Exception as e:
+                    self.logger.error(f"Error in training epoch {epoch+1}: {e}")
+                    # Save emergency checkpoint
+                    self._save_checkpoint(epoch, is_emergency=True)
+                    raise
+                
+                # Update learning rate
+                if self.lr_scheduler is not None:
+                    # Store current learning rate
+                    self.learning_rates.append(self.optimizer.param_groups[0]['lr'])
+                    
+                    if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        # This scheduler needs the validation metric
+                        pass  # will be updated after validation
+                    else:
+                        self.lr_scheduler.step()
+                
+                # Record train loss
+                self.train_loss_history.append(epoch_loss)
+                epoch_logs['train_loss'] = epoch_loss
+                
+                # Evaluate on validation set
+                if (epoch + 1) % self.config.eval_freq == 0:
+                    try:
+                        val_metrics = self._validate_epoch(epoch)
+                        val_map = val_metrics['mAP']
+                        self.val_map_history.append(val_map)
+                        epoch_logs.update(val_metrics)
+                        epoch_logs['val_map'] = val_map
+                        
+                        # Update LR scheduler if it's ReduceLROnPlateau
+                        if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                            self.lr_scheduler.step(val_map)
+                    except Exception as e:
+                        self.logger.error(f"Error in validation epoch {epoch+1}: {e}")
+                        # Use previous metrics or default values
+                        val_map = self.val_map_history[-1] if self.val_map_history else 0.0
+                        self.val_map_history.append(val_map)
+                        epoch_logs['val_map'] = val_map
                 
                 # Add model and optimizer to logs for callbacks
                 epoch_logs['model'] = self.model
                 epoch_logs['optimizer'] = self.optimizer
                 epoch_logs['lr_scheduler'] = self.lr_scheduler
+                
+                # Call on_epoch_end for callbacks
+                for callback in self.callbacks:
+                    callback.on_epoch_end(epoch, epoch_logs)
+                
+                # Check if training should be stopped (from callbacks)
+                if epoch_logs.get('stop_training', False):
+                    self.logger.info("Early stopping triggered")
+                    break
+                
+                # Save periodic checkpoint (if not saved by callback)
+                if (epoch + 1) % self.config.save_freq == 0:
+                    self._save_checkpoint(epoch)
             
-            # Call on_epoch_end for callbacks
+            # Training completed, save final checkpoint
+            self._save_checkpoint(self.config.epochs - 1, is_final=True)
+        
+        except Exception as e:
+            self.logger.error(f"Training interrupted: {e}")
+            # Save emergency checkpoint
+            self._save_checkpoint(self.start_epoch + len(self.train_loss_history), is_emergency=True)
+            raise
+        
+        finally:
+            # Calculate total training time
+            total_time = time.time() - start_time
+            total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+            
+            # Call on_train_end for callbacks
+            end_logs = {'total_time': total_time_str}
             for callback in self.callbacks:
-                callback.on_epoch_end(epoch, epoch_logs)
+                callback.on_train_end(end_logs)
             
-            # Check if training should be stopped (from callbacks)
-            if epoch_logs.get('stop_training', False):
-                self.logger.info("Early stopping triggered")
-                break
-        
-        # Calculate total training time
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        
-        # Call on_train_end for callbacks
-        end_logs = {'total_time': total_time_str}
-        for callback in self.callbacks:
-            callback.on_train_end(end_logs)
-        
-        self.logger.info(f"Training completed in {total_time_str}")
-        self.logger.info(f"Best validation mAP: {self.best_val_map:.4f}")
-        
-        # Create and return training summary
-        training_summary = {
-            'best_val_map': self.best_val_map,
-            'train_loss_history': self.train_loss_history,
-            'val_map_history': self.val_map_history,
-            'learning_rates': self.learning_rates,
-            'total_training_time': total_time_str
-        }
-        
-        # Save training summary
-        with open(os.path.join(self.config.log_dir, 'training_summary.json'), 'w') as f:
-            json.dump(training_summary, f, indent=2)
-        
-        return training_summary
+            self.logger.info(f"Training completed in {total_time_str}")
+            self.logger.info(f"Best validation mAP: {self.best_val_map:.4f}")
+            
+            # Create and return training summary
+            training_summary = {
+                'best_val_map': self.best_val_map,
+                'train_loss_history': self.train_loss_history,
+                'val_map_history': self.val_map_history,
+                'learning_rates': self.learning_rates,
+                'total_training_time': total_time_str
+            }
+            
+            # Save training summary
+            summary_path = os.path.join(self.config.log_dir, 'training_summary.json')
+            try:
+                with open(summary_path, 'w') as f:
+                    json.dump(training_summary, f, indent=2)
+            except Exception as e:
+                self.logger.error(f"Failed to save training summary: {e}")
+            
+            return training_summary
     
     def _train_epoch(self, epoch: int) -> float:
         """Train for one epoch."""
@@ -230,73 +263,78 @@ class Trainer:
         accumulation_steps = getattr(self.config, 'gradient_accumulation_steps', 1)
         
         for i, batch in enumerate(epoch_iterator):
-            # Call on_batch_begin for callbacks
-            batch_logs = {'batch': i, 'size': len(batch[0])}
-            for callback in self.callbacks:
-                callback.on_batch_begin(i, batch_logs)
+            try:
+                # Call on_batch_begin for callbacks
+                batch_logs = {'batch': i, 'size': len(batch[0])}
+                for callback in self.callbacks:
+                    callback.on_batch_begin(i, batch_logs)
+                
+                # Get images and targets
+                images, targets = batch
+                
+                # Move data to device
+                images = [img.to(self.device) for img in images]
+                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+                
+                # Forward pass
+                losses = self.model(images, targets)
+                
+                # Calculate total loss
+                loss = sum(loss for loss in losses.values())
+                
+                # Scale the loss for gradient accumulation
+                loss = loss / accumulation_steps
+                
+                # Backward pass
+                loss.backward()
+                
+                # Check for NaN loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self.logger.error(f"NaN or Inf loss detected: {loss.item()}")
+                    self.logger.error(f"Loss breakdown: {losses}")
+                    raise RuntimeError("NaN or Inf loss detected")
+                
+                # Only update weights after accumulation_steps
+                if (i + 1) % accumulation_steps == 0:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                
+                # For logging, use the unscaled loss
+                batch_loss = loss.item() * accumulation_steps
+                total_loss += batch_loss
+                
+                # Update metrics display
+                current_lr = self.optimizer.param_groups[0]['lr']
+                epoch_iterator.set_postfix({
+                    'loss': batch_loss,
+                    'lr': current_lr
+                })
+                
+                self.global_step += 1
+                
+                # Update batch_logs for callbacks
+                batch_logs.update({
+                    'loss': batch_loss,
+                    'lr': current_lr
+                })
+                
+                # Call on_batch_end for callbacks
+                for callback in self.callbacks:
+                    callback.on_batch_end(i, batch_logs)
+                
+                # Log batch metrics
+                if i % self.config.log_freq == 0:
+                    self.logger.info(f"Epoch: {epoch+1}, Batch: {i}, Loss: {batch_loss:.4f}, LR: {current_lr:.6f}")
             
-            # Get images and targets
-            images, targets = batch
-            
-            # Move data to device
-            images = [img.to(self.device) for img in images]
-            targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
-            
-            # Forward pass
-            losses = self.model(images, targets)
-            
-            # Calculate total loss
-            loss = sum(loss for loss in losses.values())
-            
-            # Scale the loss for gradient accumulation
-            loss = loss / accumulation_steps
-            
-            # Backward pass
-            loss.backward()
-            
-            # Check for NaN loss
-            if torch.isnan(loss) or torch.isinf(loss):
-                self.logger.error(f"NaN or Inf loss detected: {loss.item()}")
-                self.logger.error(f"Loss breakdown: {losses}")
-                raise RuntimeError("NaN or Inf loss detected")
-            
-            # Only update weights after accumulation_steps
-            if (i + 1) % accumulation_steps == 0:
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-            
-            # For logging, use the unscaled loss
-            batch_loss = loss.item() * accumulation_steps
-            total_loss += batch_loss
-            
-            # Update metrics display
-            current_lr = self.optimizer.param_groups[0]['lr']
-            epoch_iterator.set_postfix({
-                'loss': batch_loss,
-                'lr': current_lr
-            })
-            
-            self.global_step += 1
-            
-            
-            # Update batch_logs for callbacks
-            batch_logs.update({
-                'loss': loss.item(),
-                'lr': current_lr
-            })
-            
-            # Call on_batch_end for callbacks
-            for callback in self.callbacks:
-                callback.on_batch_end(i, batch_logs)
-            
-            # Log batch metrics
-            if i % self.config.log_freq == 0:
-                self.logger.info(f"Epoch: {epoch+1}, Batch: {i}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}")
+            except Exception as e:
+                self.logger.error(f"Error in batch {i} of epoch {epoch+1}: {e}")
+                # Skip this batch and continue with next
+                continue
         
         # Calculate average loss
-        avg_loss = total_loss / len(self.train_loader)
+        avg_loss = total_loss / max(1, len(self.train_loader))
         self.logger.info(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
         
         return avg_loss
@@ -310,30 +348,45 @@ class Trainer:
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc=f"Validation (Epoch {epoch+1})"):
-                # Get images and targets
-                images, targets = batch
-                
-                # Move data to device
-                images = [img.to(self.device) for img in images]
-                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
-                
-                # Get predictions
-                predictions = self.model(images)
-                
-                # Convert targets to CPU for consistent evaluation
-                cpu_targets = [{k: v.cpu() for k, v in t.items()} for t in targets]
-                cpu_predictions = []
-                for pred in predictions:
-                    cpu_pred = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
-                            for k, v in pred.items()}
-                    cpu_predictions.append(cpu_pred)
-                
-                # Store predictions and targets
-                all_predictions.extend(cpu_predictions)
-                all_targets.extend(cpu_targets)
+                try:
+                    # Get images and targets
+                    images, targets = batch
+                    
+                    # Move data to device
+                    images = [img.to(self.device) for img in images]
+                    targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+                    
+                    # Get predictions
+                    predictions = self.model(images)
+                    
+                    # Convert targets to CPU for consistent evaluation
+                    cpu_targets = [{k: v.cpu() for k, v in t.items()} for t in targets]
+                    cpu_predictions = []
+                    for pred in predictions:
+                        cpu_pred = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
+                                for k, v in pred.items()}
+                        cpu_predictions.append(cpu_pred)
+                    
+                    # Store predictions and targets
+                    all_predictions.extend(cpu_predictions)
+                    all_targets.extend(cpu_targets)
+                except Exception as e:
+                    self.logger.error(f"Error in validation batch: {e}")
+                    # Skip this batch and continue with next
+                    continue
+        
+        # Skip evaluation if no predictions gathered
+        if not all_predictions:
+            self.logger.warning("No predictions gathered during validation")
+            return {'mAP': 0.0}
         
         # Evaluate predictions
-        metrics = self.evaluator.evaluate(all_predictions, all_targets)
+        try:
+            metrics = self.evaluator.evaluate(all_predictions, all_targets)
+        except Exception as e:
+            self.logger.error(f"Error evaluating predictions: {e}")
+            # Return default metrics
+            return {'mAP': 0.0}
         
         # Check if this is the best model
         if metrics['mAP'] > self.best_val_map:
@@ -344,9 +397,13 @@ class Trainer:
         
         return metrics
     
-    def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
+    def _save_checkpoint(self, epoch: int, is_best: bool = False, 
+                        is_final: bool = False, is_emergency: bool = False) -> None:
         """Save a checkpoint of the model."""
         # Only save checkpoints from main process in distributed training
+        if not is_main_process():
+            return
+        
         if hasattr(self.model, 'module'):
             # If using DDP, get underlying model
             model_state_dict = self.model.module.state_dict()
@@ -364,9 +421,7 @@ class Trainer:
             'val_map_history': self.val_map_history
         }
         
-        # Only process 0 should save in distributed mode
-        from src.utils.distributed import is_main_process
-        if is_main_process():
+        try:
             # Save regular checkpoint
             checkpoint_path = os.path.join(self.config.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
             torch.save(checkpoint, checkpoint_path)
@@ -377,6 +432,20 @@ class Trainer:
                 best_path = os.path.join(self.config.checkpoint_dir, 'best_model.pth')
                 torch.save(checkpoint, best_path)
                 self.logger.info(f"Best model saved to {best_path}")
+            
+            # Save final model
+            if is_final:
+                final_path = os.path.join(self.config.checkpoint_dir, 'final_model.pth')
+                torch.save(checkpoint, final_path)
+                self.logger.info(f"Final model saved to {final_path}")
+            
+            # Save emergency checkpoint
+            if is_emergency:
+                emergency_path = os.path.join(self.config.checkpoint_dir, f'emergency_epoch_{epoch+1}.pth')
+                torch.save(checkpoint, emergency_path)
+                self.logger.info(f"Emergency checkpoint saved to {emergency_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save checkpoint: {e}")
     
     def _load_checkpoint(self, checkpoint_path: str) -> None:
         """Load a checkpoint.
@@ -390,18 +459,31 @@ class Trainer:
         
         self.logger.info(f"Loading checkpoint from {checkpoint_path}")
         
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        if checkpoint['lr_scheduler_state_dict'] and self.lr_scheduler:
-            self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
-        
-        self.start_epoch = checkpoint['epoch'] + 1
-        self.best_val_map = checkpoint['best_val_map']
-        self.global_step = checkpoint['global_step']
-        self.train_loss_history = checkpoint['train_loss_history']
-        self.val_map_history = checkpoint.get('val_map_history', [])
-        
-        self.logger.info(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model
+            if hasattr(self.model, 'module'):
+                # If using DDP, load to module
+                self.model.module.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                
+            # Load optimizer
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Load LR scheduler if available
+            if checkpoint['lr_scheduler_state_dict'] and self.lr_scheduler:
+                self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+            
+            # Load training state
+            self.start_epoch = checkpoint['epoch'] + 1
+            self.best_val_map = checkpoint['best_val_map']
+            self.global_step = checkpoint['global_step']
+            self.train_loss_history = checkpoint['train_loss_history']
+            self.val_map_history = checkpoint.get('val_map_history', [])
+            
+            self.logger.info(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+        except Exception as e:
+            self.logger.error(f"Failed to load checkpoint: {e}")
+            raise

@@ -25,7 +25,45 @@ def setup_distributed(rank: int, world_size: int) -> None:
 
 def cleanup_distributed() -> None:
     """Clean up distributed training."""
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process() -> bool:
+    """Check if this is the main process in distributed training.
+    
+    Returns:
+        True if this is the main process or not in distributed mode
+    """
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def get_world_size() -> int:
+    """Get the number of processes in distributed training.
+    
+    Returns:
+        Number of processes or 1 if not in distributed mode
+    """
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+def all_gather(data: torch.Tensor) -> List[torch.Tensor]:
+    """Gather data from all processes.
+    
+    Args:
+        data: Tensor to gather
+        
+    Returns:
+        List of gathered tensors
+    """
+    if not dist.is_initialized():
+        return [data]
+    
+    world_size = dist.get_world_size()
+    gathered_data = [torch.zeros_like(data) for _ in range(world_size)]
+    dist.all_gather(gathered_data, data)
+    
+    return gathered_data
 
 
 def run_distributed(
@@ -76,45 +114,12 @@ def _distributed_worker(
     kwargs['rank'] = rank
     kwargs['device'] = device
     
-    # Run function
-    fn(*args, **kwargs)
-    
-    # Clean up
-    cleanup_distributed()
-
-
-def is_main_process() -> bool:
-    """Check if this is the main process in distributed training.
-    
-    Returns:
-        True if this is the main process or not in distributed mode
-    """
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-
-def get_world_size() -> int:
-    """Get the number of processes in distributed training.
-    
-    Returns:
-        Number of processes or 1 if not in distributed mode
-    """
-    return dist.get_world_size() if dist.is_initialized() else 1
-
-
-def all_gather(data: torch.Tensor) -> List[torch.Tensor]:
-    """Gather data from all processes.
-    
-    Args:
-        data: Tensor to gather
-        
-    Returns:
-        List of gathered tensors
-    """
-    if not dist.is_initialized():
-        return [data]
-    
-    world_size = dist.get_world_size()
-    gathered_data = [torch.zeros_like(data) for _ in range(world_size)]
-    dist.all_gather(gathered_data, data)
-    
-    return gathered_data
+    try:
+        # Run function
+        fn(*args, **kwargs)
+    except Exception as e:
+        print(f"Error in worker {rank}: {e}")
+        raise
+    finally:
+        # Clean up
+        cleanup_distributed()

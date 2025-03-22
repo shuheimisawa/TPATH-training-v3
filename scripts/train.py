@@ -1,9 +1,11 @@
 # scripts/train.py
 import os
+import sys
 import json
 import argparse
 import torch
 from torch.utils.data import DataLoader
+import traceback
 
 from src.config.model_config import ModelConfig
 from src.config.training_config import TrainingConfig
@@ -41,68 +43,29 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    # Parse arguments
-    args = parse_args()
+def create_model(config, device, checkpoint_path=None):
+    """Factory function to create and initialize model.
     
-    # Create logger
-    os.makedirs(args.log_dir, exist_ok=True)
-    logger = get_logger(
-        name="train",
-        log_file=os.path.join(args.log_dir, "train.log")
-    )
-    
-    # Set random seed
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
-    
-    # Load configuration from YAML file
-    logger.info(f"Loading configuration from {args.config}")
-    config_dict = load_yaml(args.config)
-    
-    # Create configuration objects and populate from YAML
-    model_config = ModelConfig()
-    training_config = TrainingConfig()
-    
-    # Update model config with values from YAML
-    for section, values in config_dict.get('model', {}).items():
-        if hasattr(model_config, section):
-            if isinstance(getattr(model_config, section), dict):
-                getattr(model_config, section).update(values)
-            else:
-                setattr(model_config, section, values)
-    
-    # Update training config with values from YAML
-    for section, values in config_dict.get('training', {}).items():
-        if hasattr(training_config, section):
-            if isinstance(getattr(training_config, section), dict):
-                getattr(training_config, section).update(values)
-            else:
-                setattr(training_config, section, values)
-    
-    # Update config with command line arguments
-    training_config.checkpoint_dir = args.checkpoint_dir
-    training_config.log_dir = args.log_dir
-    training_config.seed = args.seed
-    training_config.distributed = args.distributed
-    
-    # Create directories
-    os.makedirs(training_config.checkpoint_dir, exist_ok=True)
-    os.makedirs(training_config.log_dir, exist_ok=True)
-    
-    # Handle distributed training if requested
-    if args.distributed:
-        logger.info("Starting distributed training")
-        world_size = len(training_config.gpu_ids)
-        run_distributed(train_worker, world_size, args, model_config, training_config)
-    else:
-        # Set device
-        device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Using device: {device}")
+    Args:
+        config: Model configuration
+        device: Device to run the model on
+        checkpoint_path: Optional path to checkpoint to load
         
-        # Call training function directly
-        train_worker(0, args, model_config, training_config, device=device)
+    Returns:
+        Initialized model
+    """
+    model = CascadeMaskRCNN(config)
+    model.to(device)
+    
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded checkpoint from {checkpoint_path}")
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+    
+    return model
 
 
 def train_worker(rank, args, model_config, config, device=None):
@@ -110,86 +73,168 @@ def train_worker(rank, args, model_config, config, device=None):
     # Setup distributed training if needed
     if args.distributed:
         setup_distributed(rank, len(config.gpu_ids))
-        device = torch.device(f'cuda:{rank}')
+        device = torch.device(f"cuda:{rank}")
     
     # Get logger
     logger = get_logger(name=f"train_worker_{rank}")
     
-    # Create model
-    logger.info("Creating model")
-    model = CascadeMaskRCNN(model_config)
-    model.to(device)
-    
-    # Load checkpoint if resuming
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info(f"Loaded checkpoint from {args.resume}")
+    try:
+        # Create model
+        logger.info("Creating model")
+        model = create_model(model_config, device, args.resume)
         
         # Ensure parameters are synchronized before DDP wrapping
         if args.distributed:
             # Broadcast model parameters from rank 0
             for param in model.parameters():
                 torch.distributed.broadcast(param.data, 0)
+        
+# Wrap model with DDP if distributed
+        if args.distributed:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            model = DDP(model, device_ids=[rank])
+        
+        # Create data loaders
+        logger.info("Creating dataloaders")
+        dataloaders = create_dataloaders(config, distributed=args.distributed)
+        
+        # Create callbacks
+        callbacks = []
+        
+        # Model checkpoint callback
+        checkpoint_path = os.path.join(config.checkpoint_dir, 'checkpoint_epoch_{epoch:02d}.pth')
+        checkpoint_callback = ModelCheckpoint(
+            filepath=checkpoint_path,
+            monitor='val_map',
+            save_best_only=True,
+            mode='max',
+            verbose=True
+        )
+        callbacks.append(checkpoint_callback)
+        
+        # Early stopping callback
+        early_stopping = EarlyStopping(
+            monitor='val_map',
+            min_delta=0.001,
+            patience=5,
+            mode='max',
+            verbose=True
+        )
+        callbacks.append(early_stopping)
+        
+        # Create trainer
+        logger.info("Creating trainer")
+        trainer = Trainer(
+            model=model,
+            train_loader=dataloaders['train'],
+            val_loader=dataloaders['val'],
+            config=config,
+            device=device,
+            callbacks=callbacks
+        )
+        
+        # Train model
+        logger.info("Starting training")
+        training_summary = trainer.train(resume_from=args.resume)
+        logger.info("Training completed")
+        
+        # Log training summary
+        if rank == 0:
+            logger.info(f"Best validation mAP: {training_summary['best_val_map']:.4f}")
+            logger.info(f"Total training time: {training_summary['total_training_time']}")
     
-    # Wrap model with DDP if distributed
-    if args.distributed:
-        from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[rank])
-    
-    # Create data loaders
-    logger.info("Creating dataloaders")
-    dataloaders = create_dataloaders(config, distributed=args.distributed)
-    
-    # Create callbacks
-    callbacks = []
-    
-    # Model checkpoint callback
-    checkpoint_path = os.path.join(config.checkpoint_dir, 'checkpoint_epoch_{epoch:02d}.pth')
-    checkpoint_callback = ModelCheckpoint(
-        filepath=checkpoint_path,
-        monitor='val_map',
-        save_best_only=True,
-        mode='max',
-        verbose=True
-    )
-    callbacks.append(checkpoint_callback)
-    
-    # Early stopping callback
-    early_stopping = EarlyStopping(
-        monitor='val_map',
-        min_delta=0.001,
-        patience=5,
-        mode='max',
-        verbose=True
-    )
-    callbacks.append(early_stopping)
-    
-    # Create trainer
-    logger.info("Creating trainer")
-    trainer = Trainer(
-        model=model,
-        train_loader=dataloaders['train'],
-        val_loader=dataloaders['val'],
-        config=config,
-        device=device,
-        callbacks=callbacks
-    )
-    
-    # Train model
-    logger.info("Starting training")
-    training_summary = trainer.train(resume_from=args.resume)
-    logger.info("Training completed")
-    
-    # Log training summary
-    if rank == 0:
-        logger.info(f"Best validation mAP: {training_summary['best_val_map']:.4f}")
-        logger.info(f"Total training time: {training_summary['total_training_time']}")
+    except Exception as e:
+        logger.error(f"Training error: {e}")
+        logger.error(traceback.format_exc())
+        if args.distributed:
+            cleanup_distributed()
+        raise
     
     # Clean up distributed training
     if args.distributed:
         cleanup_distributed()
 
 
+def main():
+    try:
+        # Parse arguments
+        args = parse_args()
+        
+        # Create logger
+        os.makedirs(args.log_dir, exist_ok=True)
+        logger = get_logger(
+            name="train",
+            log_file=os.path.join(args.log_dir, "train.log")
+        )
+        
+        # Set random seed
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(args.seed)
+        
+        # Load configuration from YAML file
+        logger.info(f"Loading configuration from {args.config}")
+        if not os.path.exists(args.config):
+            logger.error(f"Config file not found: {args.config}")
+            return 1
+            
+        try:
+            config_dict = load_yaml(args.config)
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            return 1
+        
+        # Create configuration objects and populate from YAML
+        model_config = ModelConfig()
+        training_config = TrainingConfig()
+        
+        # Update model config with values from YAML
+        for section, values in config_dict.get('model', {}).items():
+            if hasattr(model_config, section):
+                if isinstance(getattr(model_config, section), dict):
+                    getattr(model_config, section).update(values)
+                else:
+                    setattr(model_config, section, values)
+        
+        # Update training config with values from YAML
+        for section, values in config_dict.get('training', {}).items():
+            if hasattr(training_config, section):
+                if isinstance(getattr(training_config, section), dict):
+                    getattr(training_config, section).update(values)
+                else:
+                    setattr(training_config, section, values)
+        
+        # Update config with command line arguments
+        training_config.checkpoint_dir = args.checkpoint_dir
+        training_config.log_dir = args.log_dir
+        training_config.seed = args.seed
+        training_config.distributed = args.distributed
+        
+        # Create directories
+        os.makedirs(training_config.checkpoint_dir, exist_ok=True)
+        os.makedirs(training_config.log_dir, exist_ok=True)
+        
+        # Handle distributed training if requested
+        if args.distributed:
+            logger.info("Starting distributed training")
+            world_size = len(training_config.gpu_ids)
+            run_distributed(train_worker, world_size, args, model_config, training_config)
+        else:
+            # Set device
+            device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+            logger.info(f"Using device: {device}")
+            
+            # Call training function directly
+            train_worker(0, args, model_config, training_config, device=device)
+        
+        return 0
+    
+    except Exception as e:
+        print(f"Critical error: {e}")
+        print(traceback.format_exc())
+        return 1
+
+
 if __name__ == '__main__':
-    main()
+    exit_code = main()
+    sys.exit(exit_code)

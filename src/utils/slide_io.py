@@ -1,11 +1,10 @@
-# src/utils/slide_io.py
 import os
 import numpy as np
 import openslide
 from PIL import Image
 from typing import Dict, List, Tuple, Optional, Union, Any
 
-from ..utils.logger import get_logger
+from .logger import get_logger
 
 
 class SlideReader:
@@ -25,20 +24,31 @@ class SlideReader:
             raise ValueError(f"File {slide_path} is not a valid slide file")
         
         self.slide_path = slide_path
-        self.slide = openslide.OpenSlide(slide_path)
+        self.slide = None
         self.logger = get_logger(name="slide_reader")
         
-        # Get slide properties
-        self.width, self.height = self.slide.dimensions
-        self.level_count = self.slide.level_count
-        self.level_dimensions = self.slide.level_dimensions
-        self.level_downsamples = self.slide.level_downsamples
-        
-        self.logger.info(f"Loaded slide {os.path.basename(slide_path)}")
-        self.logger.info(f"Dimensions: {self.width}x{self.height}")
-        self.logger.info(f"Level count: {self.level_count}")
-        self.logger.info(f"Level dimensions: {self.level_dimensions}")
-        self.logger.info(f"Level downsamples: {self.level_downsamples}")
+        try:
+            self.slide = openslide.OpenSlide(slide_path)
+            
+            # Get slide properties
+            self.width, self.height = self.slide.dimensions
+            self.level_count = self.slide.level_count
+            self.level_dimensions = self.slide.level_dimensions
+            self.level_downsamples = self.slide.level_downsamples
+            
+            # Get pixel size if available
+            self.pixel_size_x = float(self.slide.properties.get(openslide.PROPERTY_NAME_MPP_X, 0))
+            self.pixel_size_y = float(self.slide.properties.get(openslide.PROPERTY_NAME_MPP_Y, 0))
+            
+            self.logger.info(f"Loaded slide {os.path.basename(slide_path)}")
+            self.logger.info(f"Dimensions: {self.width}x{self.height}")
+            self.logger.info(f"Level count: {self.level_count}")
+            self.logger.info(f"Level dimensions: {self.level_dimensions}")
+            self.logger.info(f"Level downsamples: {self.level_downsamples}")
+        except Exception as e:
+            if self.slide is not None:
+                self.slide.close()
+            raise ValueError(f"Failed to open slide {slide_path}: {e}")
     
     def get_slide_thumbnail(self, max_size: Tuple[int, int] = (1024, 1024)) -> Image.Image:
         """Get a thumbnail of the slide.
@@ -49,7 +59,15 @@ class SlideReader:
         Returns:
             PIL Image of the thumbnail
         """
-        return self.slide.get_thumbnail(max_size)
+        if self.slide is None:
+            raise ValueError("Slide is not open")
+        
+        try:
+            return self.slide.get_thumbnail(max_size)
+        except Exception as e:
+            self.logger.error(f"Error getting thumbnail: {e}")
+            # Create a blank thumbnail as fallback
+            return Image.new('RGB', max_size, color=(255, 255, 255))
     
     def read_region(self, 
                    location: Tuple[int, int], 
@@ -65,9 +83,28 @@ class SlideReader:
         Returns:
             PIL Image of the region
         """
-        region = self.slide.read_region(location, level, size)
-        # Convert to RGB (removing alpha channel)
-        return region.convert("RGB")
+        if self.slide is None:
+            raise ValueError("Slide is not open")
+        
+        # Validate level
+        if level < 0 or level >= self.level_count:
+            raise ValueError(f"Invalid level: {level}, valid range is 0-{self.level_count-1}")
+        
+        # Validate location and size
+        if location[0] < 0 or location[1] < 0:
+            raise ValueError(f"Invalid location: {location}, coordinates must be non-negative")
+        
+        if size[0] <= 0 or size[1] <= 0:
+            raise ValueError(f"Invalid size: {size}, dimensions must be positive")
+        
+        try:
+            region = self.slide.read_region(location, level, size)
+            # Convert to RGB (removing alpha channel)
+            return region.convert("RGB")
+        except Exception as e:
+            self.logger.error(f"Error reading region: {e}")
+            # Return a blank image of the requested size as fallback
+            return Image.new('RGB', size, color=(255, 255, 255))
     
     def get_tile(self, 
                 x: int, 
@@ -91,12 +128,17 @@ class SlideReader:
     
     def close(self) -> None:
         """Close the slide."""
-        self.slide.close()
+        if self.slide is not None:
+            self.slide.close()
+            self.slide = None
     
     def __enter__(self):
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+    
+    def __del__(self):
         self.close()
 
 
@@ -129,8 +171,8 @@ class TileExtractor:
         self.level_height = self.slide_reader.level_dimensions[level][1]
         
         # Calculate number of tiles in each dimension
-        self.n_tiles_x = (self.level_width + self.stride - 1) // self.stride
-        self.n_tiles_y = (self.level_height + self.stride - 1) // self.stride
+        self.n_tiles_x = max(1, (self.level_width + self.stride - 1) // self.stride)
+        self.n_tiles_y = max(1, (self.level_height + self.stride - 1) // self.stride)
         
         self.logger = get_logger(name="tile_extractor")
         self.logger.info(f"Initialized tile extractor")
@@ -191,8 +233,23 @@ class TileExtractor:
         tiles = []
         for tile_y in range(self.n_tiles_y):
             for tile_x in range(self.n_tiles_x):
-                tile_image, tile_info = self.extract_tile(tile_x, tile_y)
-                tiles.append((tile_image, tile_info))
+                try:
+                    tile_image, tile_info = self.extract_tile(tile_x, tile_y)
+                    tiles.append((tile_image, tile_info))
+                except Exception as e:
+                    self.logger.error(f"Error extracting tile ({tile_x}, {tile_y}): {e}")
+                    # Add a placeholder for the failed tile
+                    tile_info = {
+                        'index': (tile_x, tile_y),
+                        'x': tile_x * self.stride,
+                        'y': tile_y * self.stride,
+                        'width': min(self.tile_size, self.level_width - tile_x * self.stride),
+                        'height': min(self.tile_size, self.level_height - tile_y * self.stride),
+                        'level': self.level,
+                        'error': str(e)
+                    }
+                    blank_image = Image.new('RGB', (tile_info['width'], tile_info['height']), color=(255, 255, 255))
+                    tiles.append((blank_image, tile_info))
         
         return tiles
     
@@ -237,16 +294,16 @@ class TileStitcher:
             output_height: Height of the output image
             background_color: RGB background color for the output image
         """
-        self.output_width = output_width
-        self.output_height = output_height
+        self.output_width = max(1, output_width)
+        self.output_height = max(1, output_height)
         self.background_color = background_color
         
         # Create empty output image
-        self.output_image = Image.new('RGB', (output_width, output_height), background_color)
+        self.output_image = Image.new('RGB', (self.output_width, self.output_height), background_color)
         
         self.logger = get_logger(name="tile_stitcher")
         self.logger.info(f"Initialized tile stitcher")
-        self.logger.info(f"Output dimensions: {output_width}x{output_height}")
+        self.logger.info(f"Output dimensions: {self.output_width}x{self.output_height}")
     
     def add_tile(self, tile_image: Image.Image, x: int, y: int) -> None:
         """Add a tile to the output image.
@@ -256,6 +313,24 @@ class TileStitcher:
             x: X-coordinate of the top-left corner of the tile
             y: Y-coordinate of the top-left corner of the tile
         """
+        # Ensure coordinates are within bounds
+        if x < 0 or y < 0 or x >= self.output_width or y >= self.output_height:
+            self.logger.warning(f"Tile coordinates ({x}, {y}) out of bounds, skipping")
+            return
+        
+        # Calculate the actual region to paste
+        paste_width = min(tile_image.width, self.output_width - x)
+        paste_height = min(tile_image.height, self.output_height - y)
+        
+        if paste_width <= 0 or paste_height <= 0:
+            self.logger.warning(f"Tile dimensions invalid for pasting at ({x}, {y}), skipping")
+            return
+        
+        # Crop tile if needed
+        if tile_image.width > paste_width or tile_image.height > paste_height:
+            tile_image = tile_image.crop((0, 0, paste_width, paste_height))
+        
+        # Paste the tile
         self.output_image.paste(tile_image, (x, y))
     
     def get_output_image(self) -> Image.Image:
@@ -264,7 +339,7 @@ class TileStitcher:
         Returns:
             PIL Image of the stitched output
         """
-        return self.output_image
+        return self.output_image.copy()
     
     def save_output_image(self, output_path: str) -> None:
         """Save the stitched output image.
@@ -273,4 +348,7 @@ class TileStitcher:
             output_path: Path to save the output image
         """
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        self.output_image.save(output_path)
+        try:
+            self.output_image.save(output_path)
+        except Exception as e:
+            raise IOError(f"Failed to save stitched image to {output_path}: {e}")

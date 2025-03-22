@@ -17,6 +17,8 @@ class LRSchedulerConfig:
     step_size: int = 8
     gamma: float = 0.1
     milestones: List[int] = field(default_factory=lambda: [8, 11])
+    t_max: int = 100
+    eta_min: float = 0.0
 
 
 @dataclass
@@ -59,12 +61,13 @@ class TrainingConfig:
     epochs: int = 12
     batch_size: int = 2
     workers: int = 4
-    optimizer: OptimizerConfig = OptimizerConfig()
-    lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
-    data: DataConfig = DataConfig()
+    gradient_accumulation_steps: int = 1
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
+    data: DataConfig = field(default_factory=DataConfig)
     
     # Class weights for loss calculation
-    class_weights: ClassWeightsConfig = ClassWeightsConfig()
+    class_weights: ClassWeightsConfig = field(default_factory=ClassWeightsConfig)
     
     # Loss weights
     rpn_cls_loss_weight: float = 1.0

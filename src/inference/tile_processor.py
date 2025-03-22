@@ -7,7 +7,6 @@ from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional, Union, Any
 
 from ..utils.logger import get_logger
-from ..utils.slide_io import SlideReader, TileExtractor, TileStitcher
 from ..evaluation.visualization import visualize_prediction
 
 
@@ -60,58 +59,21 @@ class TileProcessor:
             Dictionary with detection results
         """
         with torch.no_grad():
-            # Add batch dimension if needed
-            if len(tile_tensor.shape) == 3:
-                tile_tensor = tile_tensor.unsqueeze(0)
+            try:
+                # Add batch dimension if needed
+                if len(tile_tensor.shape) == 3:
+                    tile_tensor = tile_tensor.unsqueeze(0)
+                    
+                # Move to device
+                tile_tensor = tile_tensor.to(self.device)
                 
-            # Move to device
-            tile_tensor = tile_tensor.to(self.device)
-            
-            # Run model
-            predictions = self.model([tile_tensor])
-            
-            # Get first prediction (single tile)
-            prediction = predictions[0]
-            
-            # Filter by confidence
-            keep = prediction['scores'] > self.confidence_threshold
-            
-            filtered_prediction = {
-                'boxes': prediction['boxes'][keep],
-                'labels': prediction['labels'][keep],
-                'scores': prediction['scores'][keep],
-                'masks': prediction['masks'][keep] if 'masks' in prediction else None
-            }
-            
-            # Move back to CPU
-            for k, v in filtered_prediction.items():
-                if isinstance(v, torch.Tensor):
-                    filtered_prediction[k] = v.cpu()
-            
-            return filtered_prediction
-    
-    def process_tiles_batch(self, tile_tensors: List[torch.Tensor]) -> List[Dict]:
-        """Process a batch of tiles.
-        
-        Args:
-            tile_tensors: List of tile tensors
-            
-        Returns:
-            List of dictionaries with detection results
-        """
-        if not tile_tensors:
-            return []
-            
-        with torch.no_grad():
-            # Move to device
-            tile_tensors = [t.to(self.device) for t in tile_tensors]
-            
-            # Run model
-            predictions = self.model(tile_tensors)
-            
-            # Filter by confidence
-            filtered_predictions = []
-            for prediction in predictions:
+                # Run model
+                predictions = self.model([tile_tensor])
+                
+                # Get first prediction (single tile)
+                prediction = predictions[0]
+                
+                # Filter by confidence
                 keep = prediction['scores'] > self.confidence_threshold
                 
                 filtered_prediction = {
@@ -126,9 +88,66 @@ class TileProcessor:
                     if isinstance(v, torch.Tensor):
                         filtered_prediction[k] = v.cpu()
                 
-                filtered_predictions.append(filtered_prediction)
+                return filtered_prediction
+            except Exception as e:
+                self.logger.error(f"Error processing tile: {e}")
+                # Return empty prediction
+                return {
+                    'boxes': torch.empty((0, 4)),
+                    'labels': torch.empty(0, dtype=torch.int64),
+                    'scores': torch.empty(0),
+                    'masks': None
+                }
+    
+    def process_tiles_batch(self, tile_tensors: List[torch.Tensor]) -> List[Dict]:
+        """Process a batch of tiles.
+        
+        Args:
+            tile_tensors: List of tile tensors
             
-            return filtered_predictions
+        Returns:
+            List of dictionaries with detection results
+        """
+        if not tile_tensors:
+            return []
+            
+        with torch.no_grad():
+            try:
+                # Move to device
+                tile_tensors = [t.to(self.device) for t in tile_tensors]
+                
+                # Run model
+                predictions = self.model(tile_tensors)
+                
+                # Filter by confidence
+                filtered_predictions = []
+                for prediction in predictions:
+                    keep = prediction['scores'] > self.confidence_threshold
+                    
+                    filtered_prediction = {
+                        'boxes': prediction['boxes'][keep],
+                        'labels': prediction['labels'][keep],
+                        'scores': prediction['scores'][keep],
+                        'masks': prediction['masks'][keep] if 'masks' in prediction else None
+                    }
+                    
+                    # Move back to CPU
+                    for k, v in filtered_prediction.items():
+                        if isinstance(v, torch.Tensor):
+                            filtered_prediction[k] = v.cpu()
+                    
+                    filtered_predictions.append(filtered_prediction)
+                
+                return filtered_predictions
+            except Exception as e:
+                self.logger.error(f"Error processing tile batch: {e}")
+                # Return empty predictions
+                return [{
+                    'boxes': torch.empty((0, 4)),
+                    'labels': torch.empty(0, dtype=torch.int64),
+                    'scores': torch.empty(0),
+                    'masks': None
+                } for _ in range(len(tile_tensors))]
     
     def visualize_tile_prediction(
         self,
@@ -148,9 +167,14 @@ class TileProcessor:
         Returns:
             PIL Image with visualization
         """
-        return visualize_prediction(
-            image=tile_image,
-            prediction=prediction,
-            class_names=class_names,
-            save_path=output_path
-        )
+        try:
+            return visualize_prediction(
+                image=tile_image,
+                prediction=prediction,
+                class_names=class_names,
+                save_path=output_path
+            )
+        except Exception as e:
+            self.logger.error(f"Error visualizing tile prediction: {e}")
+            # Return original image as fallback
+            return Image.fromarray(tile_image)
