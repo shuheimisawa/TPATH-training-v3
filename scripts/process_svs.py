@@ -13,7 +13,7 @@ from src.models.cascade_mask_rcnn import CascadeMaskRCNN
 from src.utils.logger import get_logger
 from src.utils.io import save_json
 from src.inference.slide_inference import SlideInference
-
+from src.utils.directml_adapter import get_dml_device, is_available
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Process SVS/WSI files for glomeruli segmentation')
@@ -96,8 +96,12 @@ def main():
         )
         
         # Set device
-        device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Using device: {device}")
+        if is_available():
+            device = get_dml_device(args.gpu)
+            logger.info(f"Using DirectML device for AMD GPU")
+        else:
+            device = torch.device('cpu')
+            logger.info("Using CPU (No DirectML device available)")
         
         # Create model
         try:

@@ -16,6 +16,8 @@ from src.evaluation.evaluator import Evaluator
 from src.evaluation.visualization import visualize_batch_predictions
 from src.utils.logger import get_logger
 from src.utils.io import load_image, save_image, save_json
+# Import the DirectML adapter
+from src.utils.directml_adapter import get_dml_device, is_available, empty_cache
 
 
 def parse_args():
@@ -86,9 +88,13 @@ def main():
             log_file=os.path.join(args.output_dir, "evaluate.log")
         )
         
-        # Set device
-        device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Using device: {device}")
+        # Set device - use DirectML for AMD GPU if available
+        if is_available():
+            device = get_dml_device(args.gpu)
+            logger.info(f"Using DirectML device for AMD GPU")
+        else:
+            device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+            logger.info(f"Using device: {device}")
         
         # Create model
         model_config = ModelConfig()
@@ -180,6 +186,10 @@ def main():
                             class_names=args.class_names,
                             save_path=os.path.join(args.output_dir, f'batch_{i+1}_predictions.png')
                         )
+                    
+                    # Clear GPU memory after each batch
+                    empty_cache()
+                    
                 except Exception as e:
                     logger.error(f"Error processing batch {i+1}: {e}")
                     continue
@@ -208,6 +218,7 @@ def main():
             logger.info(f"Metrics saved to {metrics_path}")
         except Exception as e:
             logger.error(f"Error calculating metrics: {e}")
+            logger.error(traceback.format_exc())
         
         # Save predictions
         if args.save_predictions:
@@ -233,6 +244,7 @@ def main():
                 logger.info(f"Predictions saved to {predictions_path}")
             except Exception as e:
                 logger.error(f"Error saving predictions: {e}")
+                logger.error(traceback.format_exc())
         
         logger.info("Evaluation completed")
         return 0

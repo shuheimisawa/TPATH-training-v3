@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional, Union, Any
+from src.utils.directml_adapter import empty_cache
 
 from ..utils.logger import get_logger
 from ..evaluation.visualization import visualize_prediction

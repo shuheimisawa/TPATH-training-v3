@@ -3,15 +3,18 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from typing import Callable, Any, List, Optional
-
+from src.utils.directml_adapter import is_available as directml_available
 
 def setup_distributed(rank: int, world_size: int) -> None:
     """Set up distributed training.
     
     Args:
         rank: Rank of the current process
-        world_size: Number of processes
-    """
+        world_size: Number of processes"""
+    if directml_available():
+        print("Warning: Distributed training not fully supported with DirectML.")
+        return
+    
     # Use NCCL if available, else use Gloo
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     

@@ -17,6 +17,8 @@ from ..config.training_config import TrainingConfig
 from ..evaluation.evaluator import Evaluator
 from .optimization import create_optimizer, create_lr_scheduler
 from .loss import MaskRCNNLoss
+# Import the DirectML adapter
+from ..utils.directml_adapter import empty_cache, is_available
 
 
 class Trainer:
@@ -47,6 +49,11 @@ class Trainer:
         self.config = config
         self.device = device
         self.callbacks = callbacks or []
+        
+        # Check if using DirectML and warn about distributed training
+        if config.distributed and "directml" in str(device):
+            print("Warning: Distributed training not fully supported with DirectML. Using single GPU mode.")
+            config.distributed = False
         
         # Create optimizer
         self.optimizer = create_optimizer(
@@ -210,6 +217,9 @@ class Trainer:
                 # Save periodic checkpoint (if not saved by callback)
                 if (epoch + 1) % self.config.save_freq == 0:
                     self._save_checkpoint(epoch)
+                
+                # Clear GPU cache after each epoch to avoid memory issues
+                empty_cache()
             
             # Training completed, save final checkpoint
             self._save_checkpoint(self.config.epochs - 1, is_final=True)
@@ -327,6 +337,10 @@ class Trainer:
                 # Log batch metrics
                 if i % self.config.log_freq == 0:
                     self.logger.info(f"Epoch: {epoch+1}, Batch: {i}, Loss: {batch_loss:.4f}, LR: {current_lr:.6f}")
+                
+                # Clear GPU memory every few batches to prevent OOM
+                if i % 10 == 0:
+                    empty_cache()
             
             except Exception as e:
                 self.logger.error(f"Error in batch {i} of epoch {epoch+1}: {e}")
@@ -370,6 +384,9 @@ class Trainer:
                     # Store predictions and targets
                     all_predictions.extend(cpu_predictions)
                     all_targets.extend(cpu_targets)
+                    
+                    # Clear GPU memory to avoid OOM
+                    empty_cache()
                 except Exception as e:
                     self.logger.error(f"Error in validation batch: {e}")
                     # Skip this batch and continue with next
@@ -394,6 +411,9 @@ class Trainer:
             self._save_checkpoint(epoch, is_best=True)
         
         self.logger.info(f"Epoch {epoch+1} - Validation mAP: {metrics['mAP']:.4f}")
+        
+        # Clear GPU memory after validation
+        empty_cache()
         
         return metrics
     
@@ -422,6 +442,9 @@ class Trainer:
         }
         
         try:
+            # Ensure checkpoint directory exists with proper path handling
+            os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+            
             # Save regular checkpoint
             checkpoint_path = os.path.join(self.config.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
             torch.save(checkpoint, checkpoint_path)

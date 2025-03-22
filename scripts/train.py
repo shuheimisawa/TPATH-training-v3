@@ -18,6 +18,8 @@ from src.training.callbacks import ModelCheckpoint, EarlyStopping
 from src.utils.logger import get_logger
 from src.utils.io import load_yaml
 from src.utils.distributed import setup_distributed, cleanup_distributed, run_distributed
+# Import the DirectML adapter
+from src.utils.directml_adapter import get_dml_device, is_available
 
 
 def parse_args():
@@ -60,8 +62,13 @@ def create_model(config, device, checkpoint_path=None):
     if checkpoint_path and os.path.exists(checkpoint_path):
         try:
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"Loaded checkpoint from {checkpoint_path}")
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print(f"Loaded checkpoint from {checkpoint_path}")
+            else:
+                # Try loading as direct state dict
+                model.load_state_dict(checkpoint)
+                print(f"Loaded state dictionary from {checkpoint_path}")
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
     
@@ -72,8 +79,14 @@ def train_worker(rank, args, model_config, config, device=None):
     """Training worker function for distributed training."""
     # Setup distributed training if needed
     if args.distributed:
-        setup_distributed(rank, len(config.gpu_ids))
-        device = torch.device(f"cuda:{rank}")
+        if is_available():
+            # DirectML doesn't fully support distributed training
+            print("Warning: Distributed training not fully supported with DirectML. Using single GPU mode.")
+            args.distributed = False
+            config.distributed = False
+        else:
+            setup_distributed(rank, len(config.gpu_ids))
+            device = torch.device(f"cuda:{rank}")
     
     # Get logger
     logger = get_logger(name=f"train_worker_{rank}")
@@ -89,7 +102,7 @@ def train_worker(rank, args, model_config, config, device=None):
             for param in model.parameters():
                 torch.distributed.broadcast(param.data, 0)
         
-# Wrap model with DDP if distributed
+        # Wrap model with DDP if distributed
         if args.distributed:
             from torch.nn.parallel import DistributedDataParallel as DDP
             model = DDP(model, device_ids=[rank])
@@ -139,7 +152,7 @@ def train_worker(rank, args, model_config, config, device=None):
         logger.info("Training completed")
         
         # Log training summary
-        if rank == 0:
+        if rank == 0 or not args.distributed:
             logger.info(f"Best validation mAP: {training_summary['best_val_map']:.4f}")
             logger.info(f"Total training time: {training_summary['total_training_time']}")
     
@@ -214,15 +227,25 @@ def main():
         os.makedirs(training_config.checkpoint_dir, exist_ok=True)
         os.makedirs(training_config.log_dir, exist_ok=True)
         
+        # Check if DirectML is available and disable distributed training if using DirectML
+        if is_available() and args.distributed:
+            logger.warning("Distributed training not fully supported with DirectML. Using single GPU mode.")
+            args.distributed = False
+            training_config.distributed = False
+        
         # Handle distributed training if requested
         if args.distributed:
             logger.info("Starting distributed training")
             world_size = len(training_config.gpu_ids)
             run_distributed(train_worker, world_size, args, model_config, training_config)
         else:
-            # Set device
-            device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-            logger.info(f"Using device: {device}")
+            # Set device - use DirectML for AMD GPU if available
+            if is_available():
+                device = get_dml_device(args.gpu)
+                logger.info(f"Using DirectML device for AMD GPU")
+            else:
+                device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+                logger.info(f"Using device: {device}")
             
             # Call training function directly
             train_worker(0, args, model_config, training_config, device=device)
