@@ -248,27 +248,21 @@ def main():
         os.makedirs(training_config.log_dir, exist_ok=True)
         
         # Check if DirectML is available and disable distributed training if using DirectML
-        if is_available() and args.distributed:
-            logger.warning("Distributed training not fully supported with DirectML. Using single GPU mode.")
-            args.distributed = False
-            training_config.distributed = False
-        
-        # Handle distributed training if requested
-        if args.distributed:
-            logger.info("Starting distributed training")
-            world_size = len(training_config.gpu_ids)
-            run_distributed(train_worker, world_size, args, model_config, training_config)
+        if is_available():
+            logger.info("DirectML is available")
+            device = get_dml_device(args.gpu)
+            logger.info(f"Using DirectML device: {device}")
         else:
-            # Set device - use DirectML for AMD GPU if available
-            if is_available():
-                device = get_dml_device(args.gpu)
-                logger.info(f"Using DirectML device for AMD GPU")
-            else:
-                device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-                logger.info(f"Using device: {device}")
-            
-            # Call training function directly
-            train_worker(0, args, model_config, training_config, device=device)
+            logger.info("DirectML is not available, falling back to CPU")
+            device = torch.device('cpu')
+            logger.info(f"Using device: {device}")
+        
+        # Disable distributed training for now as it's not fully supported
+        args.distributed = False
+        training_config.distributed = False
+        
+        # Call training function directly
+        train_worker(0, args, model_config, training_config, device=device)
         
         return 0
     

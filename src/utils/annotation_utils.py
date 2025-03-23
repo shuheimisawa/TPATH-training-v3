@@ -2,39 +2,36 @@
 
 import os
 import json
+import gc
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+import cv2
+from typing import Dict, List, Optional, Tuple
 
 from src.utils.logger import get_logger
+from src.utils.tissue_detection import process_tile, visualize_tissue_detection
 
 
-def load_annotations(annotation_path):
-    """Load annotations from a JSON file.
-    
-    Args:
-        annotation_path: Path to the annotation file
-        
-    Returns:
-        List of annotations
-    """
+def load_annotations(annotation_path: str) -> List[Dict]:
+    """Load annotations from JSON file."""
     logger = get_logger(name="load_annotations")
     
     try:
         with open(annotation_path, 'r') as f:
-            data = json.load(f)
+            annotations = json.load(f)
         
         # Get the slide name from the file path
         slide_name = os.path.splitext(os.path.basename(annotation_path))[0].replace('_annotations', '')
         
         # Extract annotations from the nested structure
-        if isinstance(data, dict) and slide_name in data and 'annotations' in data[slide_name]:
-            annotations = data[slide_name]['annotations']
+        if isinstance(annotations, dict) and slide_name in annotations and 'annotations' in annotations[slide_name]:
+            annotations = annotations[slide_name]['annotations']
             logger.info(f"Loaded {len(annotations)} annotations from {annotation_path}")
             return annotations
-        elif isinstance(data, list):
-            logger.info(f"Loaded {len(data)} annotations from {annotation_path}")
-            return data
+        elif isinstance(annotations, list):
+            logger.info(f"Loaded {len(annotations)} annotations from {annotation_path}")
+            return annotations
         else:
             logger.warning(f"No annotations found in {annotation_path}")
             return []
@@ -44,106 +41,169 @@ def load_annotations(annotation_path):
         return []
 
 
-def process_annotations(slide, annotations, output_dir, tile_size=512, overlap=64):
-    """Process annotations and extract tiles from a slide.
+def save_partial_annotations(annotations, output_dir, prefix="partial"):
+    """Save annotations to a temporary file to avoid data loss in case of crash.
+    
+    Args:
+        annotations: Dictionary of annotations
+        output_dir: Directory to save the annotations
+        prefix: Prefix for the output file name
+    """
+    logger = get_logger(name="save_partial_annotations")
+    
+    try:
+        # Create temporary file path
+        partial_path = os.path.join(output_dir, f"{prefix}_annotations.json")
+        
+        # Save annotations
+        with open(partial_path, 'w') as f:
+            json.dump(annotations, f, indent=2)
+            
+        logger.info(f"Saved {len(annotations)} partial annotations to {partial_path}")
+    except Exception as e:
+        logger.error(f"Error saving partial annotations: {e}")
+
+
+def save_annotations(annotations, output_dir):
+    """Save annotations to a file.
+    
+    Args:
+        annotations: Dictionary of annotations
+        output_dir: Directory to save the annotations
+    """
+    logger = get_logger(name="save_annotations")
+    
+    try:
+        # Create file path
+        annotation_path = os.path.join(output_dir, "annotations.json")
+        
+        # Save annotations
+        with open(annotation_path, 'w') as f:
+            json.dump(annotations, f, indent=2)
+            
+        logger.info(f"Saved {len(annotations)} annotations to {annotation_path}")
+    except Exception as e:
+        logger.error(f"Error saving annotations: {e}")
+
+
+def process_annotations(
+    slide,
+    annotations: List[Dict],
+    output_dir: str,
+    tile_size: int = 512,
+    overlap: int = 64,
+    filter_background: bool = True,
+    background_threshold: int = 240,
+    min_tissue_percentage: float = 0.08
+) -> Dict:
+    """Process annotations and extract tiles.
     
     Args:
         slide: SlideReader object
         annotations: List of annotations
-        output_dir: Directory to save tiles and annotations
+        output_dir: Directory to save tiles
         tile_size: Size of tiles to extract
         overlap: Overlap between tiles
+        filter_background: Whether to filter out background tiles
+        background_threshold: Threshold for background filtering
+        min_tissue_percentage: Minimum percentage of tissue required
         
     Returns:
-        Dictionary of tile annotations
+        Dictionary mapping tile paths to their annotations
     """
     logger = get_logger(name="process_annotations")
     
+    tile_annotations = {}
+    
     # Get slide dimensions
-    width, height = slide.get_dimensions()
-    logger.info(f"Processing slide with dimensions {width}x{height}")
+    width, height = slide.dimensions
     
-    # Create slide-specific output directory
-    slide_name = os.path.splitext(os.path.basename(slide.slide_path))[0]
-    slide_output_dir = os.path.join(output_dir, slide_name)
-    os.makedirs(slide_output_dir, exist_ok=True)
-    logger.info(f"Created slide output directory: {slide_output_dir}")
+    # Calculate tile positions
+    tile_positions = []
+    for x in range(0, width, tile_size - overlap):
+        for y in range(0, height, tile_size - overlap):
+            tile_positions.append((x, y))
     
-    # Calculate tile coordinates
-    tile_coordinates = []
-    for y in range(0, height, tile_size - overlap):
-        for x in range(0, width, tile_size - overlap):
-            tile_coordinates.append((x, y))
-    
-    logger.info(f"Found {len(tile_coordinates)} tiles to process")
+    logger.info(f"Processing {len(tile_positions)} tiles")
     
     # Process each tile
-    tile_annotations = {}
-    n_tiles_saved = 0
-    
-    for x, y in tqdm(tile_coordinates, desc="Processing tiles"):
+    for tile_idx, (x, y) in enumerate(tile_positions):
         try:
-            # Extract tile
+            # Read tile
             tile = slide.read_region((x, y), 0, (tile_size, tile_size))
+            tile_array = np.array(tile)
             
-            # Convert to RGB if necessary
-            if tile.mode != 'RGB':
-                tile = tile.convert('RGB')
-            
-            # Generate tile ID
-            tile_id = f"tile_{x}_{y}"
-            
-            # Match annotations to this tile
-            matched_annotations = match_annotations_to_tile(
-                tile_id, (x, y), tile_size, annotations
-            )
-            
-            # Save tile image
-            tile_path = os.path.join(slide_output_dir, f"{tile_id}.png")
-            logger.info(f"Saving tile to {tile_path}")
-            
-            try:
-                tile.save(tile_path, format='PNG')
-                n_tiles_saved += 1
+            # Check tissue content if filtering is enabled
+            if filter_background:
+                has_enough_tissue, tissue_percentage = process_tile(
+                    tile_array,
+                    threshold=background_threshold,
+                    min_tissue_percentage=min_tissue_percentage
+                )
                 
-                # Store annotations if any
-                if matched_annotations:
-                    tile_annotations[tile_id] = {
-                        'file_path': f"{tile_id}.png",
-                        'annotations': matched_annotations
-                    }
-                    logger.info(f"Saved tile {tile_id} with {len(matched_annotations)} annotations")
-                else:
-                    tile_annotations[tile_id] = {
-                        'file_path': f"{tile_id}.png",
-                        'annotations': []
-                    }
-                    logger.info(f"Saved tile {tile_id} with no annotations")
+                if not has_enough_tissue:
+                    logger.debug(f"Skipping tile at ({x}, {y}) - insufficient tissue ({tissue_percentage:.2%})")
+                    continue
+            
+            # Find annotations that overlap with this tile
+            tile_anns = []
+            for ann in annotations:
+                # Get annotation bounding box
+                bbox = ann.get('bbox', [])
+                if not bbox:
+                    continue
                 
-            except Exception as e:
-                logger.error(f"Error saving tile {tile_id}: {e}")
+                # Convert bbox to tile coordinates
+                ann_x, ann_y, ann_w, ann_h = bbox
+                tile_bbox = [
+                    ann_x - x,
+                    ann_y - y,
+                    ann_w,
+                    ann_h
+                ]
+                
+                # Check if annotation overlaps with tile
+                if (tile_bbox[0] < tile_size and
+                    tile_bbox[1] < tile_size and
+                    tile_bbox[0] + tile_bbox[2] > 0 and
+                    tile_bbox[1] + tile_bbox[3] > 0):
+                    
+                    # Clip bbox to tile boundaries
+                    tile_bbox[0] = max(0, tile_bbox[0])
+                    tile_bbox[1] = max(0, tile_bbox[1])
+                    tile_bbox[2] = min(tile_bbox[2], tile_size - tile_bbox[0])
+                    tile_bbox[3] = min(tile_bbox[3], tile_size - tile_bbox[1])
+                    
+                    # Create tile annotation
+                    tile_ann = {
+                        'bbox': tile_bbox,
+                        'category': ann.get('category', ''),
+                        'segmentation': ann.get('segmentation', [])
+                    }
+                    tile_anns.append(tile_ann)
             
-            # Close tile
-            tile.close()
-            
+            if tile_anns:
+                # Save tile
+                tile_path = os.path.join(output_dir, f"tile_{tile_idx:06d}.png")
+                tile.save(tile_path)
+                
+                # Save visualization if debugging
+                if logger.level <= 10:  # DEBUG level
+                    vis_path = os.path.join(output_dir, f"tile_{tile_idx:06d}_vis.png")
+                    visualize_tissue_detection(
+                        tile_array,
+                        threshold=background_threshold,
+                        output_path=vis_path
+                    )
+                
+                # Add to annotations
+                tile_annotations[tile_path] = tile_anns
+                
         except Exception as e:
             logger.error(f"Error processing tile at ({x}, {y}): {e}")
             continue
     
-    logger.info(f"Processed {len(tile_coordinates)} tiles, saved {n_tiles_saved} tiles")
-    
-    # Save annotations
-    if tile_annotations:
-        annotation_path = os.path.join(slide_output_dir, "annotations.json")
-        try:
-            with open(annotation_path, 'w') as f:
-                json.dump(tile_annotations, f, indent=2)
-            logger.info(f"Saved {len(tile_annotations)} tile annotations to {annotation_path}")
-        except Exception as e:
-            logger.error(f"Error saving annotations to {annotation_path}: {e}")
-    else:
-        logger.warning("No tiles were saved")
-    
+    logger.info(f"Processed {len(tile_annotations)} tiles with annotations")
     return tile_annotations
 
 
@@ -268,4 +328,4 @@ def match_annotations_to_tile(tile_id, tile_pos, tile_size, annotations):
             logger.error(f"Error processing annotation: {e}")
             continue
     
-    return matched_annotations 
+    return matched_annotations

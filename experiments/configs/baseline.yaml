@@ -80,9 +80,9 @@ training:
   
   data:
     dataset_type: 'GlomeruliDataset'
-    train_path: 'C:/Users/misaw/OneDrive/Shuhei/OneDrive/Desktop/python_work/TPATH Training/glomeruli-training/data_test/processed/dataset/train'
-    val_path: 'C:/Users/misaw/OneDrive/Shuhei/OneDrive/Desktop/python_work/TPATH Training/glomeruli-training/data_test/processed/dataset/val'
-    test_path: 'C:/Users/misaw/OneDrive/Shuhei/OneDrive/Desktop/python_work/TPATH Training/glomeruli-training/data_test/processed/dataset/test'
+    train_path: 'data_test/processed/train'
+    val_path: 'data_test/processed/val'
+    test_path: 'data_test/processed/test'
     img_size: [512, 512]  # Reduced from 1024x1024 to 512x512 for better memory management
     classes: ['Normal', 'Sclerotic', 'Partially_sclerotic', 'Uncertain']
     
@@ -98,9 +98,23 @@ training:
       transpose:
         p: 0.5
       random_crop:
-        p: 0.3
-        height: 400  # Adjusted for new image size
-        width: 400   # Adjusted for new image size
+        p: 0.5
+        size: [512, 512]
+      random_brightness_contrast:
+        p: 0.5
+        brightness_limit: 0.2
+        contrast_limit: 0.2
+      random_gamma:
+        p: 0.5
+        gamma_limit: (80, 120)
+      gauss_noise:
+        p: 0.5
+        var_limit: (10.0, 50.0)
+      elastic_transform:
+        p: 0.5
+        alpha: 120
+        sigma: 120 * 0.05
+        alpha_affine: 120 * 0.03
     
     # Normalization
     mean: [0.485, 0.456, 0.406]

@@ -20,10 +20,10 @@ class LRSchedulerConfig:
 
 @dataclass
 class DataConfig:
-    train_path: str = "data/train"
-    val_path: str = "data/val"
-    test_path: str = "data/test"
-    img_size: Tuple[int, int] = (1024, 1024)
+    train_path: str = "data_test/processed/train"
+    val_path: str = "data_test/processed/val"
+    test_path: str = "data_test/processed/test"
+    img_size: Tuple[int, int] = (512, 512)
     classes: List[str] = field(default_factory=lambda: ["Normal", "Sclerotic", "Partially_sclerotic", "Uncertain"])
     
     # Data augmentation
@@ -33,7 +33,11 @@ class DataConfig:
         "vertical_flip": {"p": 0.5},
         "random_rotate_90": {"p": 0.5},
         "transpose": {"p": 0.5},
-        "random_crop": {"p": 0.3, "height": 800, "width": 800}
+        "random_crop": {"p": 0.5, "size": [512, 512]},
+        "random_brightness_contrast": {"p": 0.5, "brightness_limit": 0.2, "contrast_limit": 0.2},
+        "random_gamma": {"p": 0.5, "gamma_limit": (80, 120)},
+        "gauss_noise": {"p": 0.5, "var_limit": (10.0, 50.0)},
+        "elastic_transform": {"p": 0.5, "alpha": 120, "sigma": 120 * 0.05, "alpha_affine": 120 * 0.03}
     })
     
     # Normalization
