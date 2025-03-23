@@ -1,5 +1,6 @@
 # Virtual Environments
 myenv/
+fresh_venv/
 venv/
 ENV/
 env/
@@ -69,6 +70,7 @@ analysis_results/
 *.svs
 *.ndpi
 *.json
+*.geojson
 !experiments/configs/*.json
 
 # IDE specific files
