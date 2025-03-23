@@ -55,9 +55,9 @@ model:
     roi_size: [14, 14]
     in_channels: 256
     conv_kernel_size: 1
-    classes: 4  # background + 3 classes (GN, GL, GS)
+    classes: 5  # background + 4 classes (Normal, Sclerotic, Partially_sclerotic, Uncertain)
   
-  num_classes: 4  # background + 3 classes (GN, GL, GS)
+  num_classes: 5  # background + 4 classes (Normal, Sclerotic, Partially_sclerotic, Uncertain)
   pretrained: null
 
 # Training configuration
@@ -80,11 +80,11 @@ training:
   
   data:
     dataset_type: 'GlomeruliDataset'
-    train_path: 'data/train'
-    val_path: 'data/val'
-    test_path: 'data/test'
-    img_size: [1024, 1024]
-    classes: ['GN', 'GL', 'GS']
+    train_path: 'C:/Users/misaw/OneDrive/Shuhei/OneDrive/Desktop/python_work/TPATH Training/glomeruli-training/data_test/processed/dataset/train'
+    val_path: 'C:/Users/misaw/OneDrive/Shuhei/OneDrive/Desktop/python_work/TPATH Training/glomeruli-training/data_test/processed/dataset/val'
+    test_path: 'C:/Users/misaw/OneDrive/Shuhei/OneDrive/Desktop/python_work/TPATH Training/glomeruli-training/data_test/processed/dataset/test'
+    img_size: [512, 512]  # Reduced from 1024x1024 to 512x512 for better memory management
+    classes: ['Normal', 'Sclerotic', 'Partially_sclerotic', 'Uncertain']
     
     # Data augmentation
     use_augmentation: true
@@ -99,8 +99,8 @@ training:
         p: 0.5
       random_crop:
         p: 0.3
-        height: 800
-        width: 800
+        height: 400  # Adjusted for new image size
+        width: 400   # Adjusted for new image size
     
     # Normalization
     mean: [0.485, 0.456, 0.406]
@@ -123,6 +123,11 @@ training:
   # Distributed training
   distributed: false
   gpu_ids: [0]
+  
+  # Memory optimization
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
   
   # Debugging
   debug: false

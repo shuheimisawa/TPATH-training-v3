@@ -45,6 +45,24 @@ def parse_args():
     return parser.parse_args()
 
 
+def update_config_from_dict(config_obj, config_dict):
+    """Update a config object with values from a dictionary, respecting nested dataclasses."""
+    for key, value in config_dict.items():
+        if hasattr(config_obj, key):
+            attr = getattr(config_obj, key)
+            # Check if attribute is a dataclass or a similar object with __dict__
+            if hasattr(attr, '__dict__') and not isinstance(attr, (str, int, float, bool, list, dict)):
+                # Recursively update nested config object
+                if isinstance(value, dict):
+                    update_config_from_dict(attr, value)
+                else:
+                    setattr(config_obj, key, value)
+            else:
+                # Direct attribute update
+                setattr(config_obj, key, value)
+    return config_obj
+
+
 def create_model(config, device, checkpoint_path=None):
     """Factory function to create and initialize model.
     
@@ -92,6 +110,18 @@ def train_worker(rank, args, model_config, config, device=None):
     logger = get_logger(name=f"train_worker_{rank}")
     
     try:
+        # Initialize device if not provided
+        if device is None:
+            if is_available():
+                device = get_dml_device()
+                logger.info("Using DirectML device for AMD GPU")
+            elif torch.cuda.is_available():
+                device = torch.device("cuda:0")
+                logger.info("Using CUDA device")
+            else:
+                device = torch.device("cpu")
+                logger.info("Using CPU device")
+        
         # Create model
         logger.info("Creating model")
         model = create_model(model_config, device, args.resume)
@@ -201,21 +231,11 @@ def main():
         model_config = ModelConfig()
         training_config = TrainingConfig()
         
-        # Update model config with values from YAML
-        for section, values in config_dict.get('model', {}).items():
-            if hasattr(model_config, section):
-                if isinstance(getattr(model_config, section), dict):
-                    getattr(model_config, section).update(values)
-                else:
-                    setattr(model_config, section, values)
+        # Update model config with values from YAML using the new function
+        update_config_from_dict(model_config, config_dict.get('model', {}))
         
-        # Update training config with values from YAML
-        for section, values in config_dict.get('training', {}).items():
-            if hasattr(training_config, section):
-                if isinstance(getattr(training_config, section), dict):
-                    getattr(training_config, section).update(values)
-                else:
-                    setattr(training_config, section, values)
+        # Update training config with values from YAML using the new function
+        update_config_from_dict(training_config, config_dict.get('training', {}))
         
         # Update config with command line arguments
         training_config.checkpoint_dir = args.checkpoint_dir

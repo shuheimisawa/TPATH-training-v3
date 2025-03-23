@@ -424,26 +424,30 @@ class Trainer:
         if not is_main_process():
             return
         
-        if hasattr(self.model, 'module'):
-            # If using DDP, get underlying model
-            model_state_dict = self.model.module.state_dict()
-        else:
-            model_state_dict = self.model.state_dict()
-            
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model_state_dict,
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'lr_scheduler_state_dict': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
-            'best_val_map': self.best_val_map,
-            'global_step': self.global_step,
-            'train_loss_history': self.train_loss_history,
-            'val_map_history': self.val_map_history
-        }
-        
         try:
             # Ensure checkpoint directory exists with proper path handling
             os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+            
+            # Get model state dict
+            if hasattr(self.model, 'module'):
+                # If using DDP, get underlying model
+                model_state_dict = self.model.module.state_dict()
+            else:
+                model_state_dict = self.model.state_dict()
+            
+            # Move state dict to CPU before saving
+            model_state_dict = {k: v.cpu() for k, v in model_state_dict.items()}
+            
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model_state_dict,
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'lr_scheduler_state_dict': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+                'best_val_map': self.best_val_map,
+                'global_step': self.global_step,
+                'train_loss_history': self.train_loss_history,
+                'val_map_history': self.val_map_history
+            }
             
             # Save regular checkpoint
             checkpoint_path = os.path.join(self.config.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
@@ -467,8 +471,19 @@ class Trainer:
                 emergency_path = os.path.join(self.config.checkpoint_dir, f'emergency_epoch_{epoch+1}.pth')
                 torch.save(checkpoint, emergency_path)
                 self.logger.info(f"Emergency checkpoint saved to {emergency_path}")
+                
         except Exception as e:
             self.logger.error(f"Failed to save checkpoint: {e}")
+            # Try to save a minimal checkpoint with just the model state
+            try:
+                minimal_path = os.path.join(self.config.checkpoint_dir, f'minimal_epoch_{epoch+1}.pth')
+                if hasattr(self.model, 'module'):
+                    torch.save(self.model.module.state_dict(), minimal_path)
+                else:
+                    torch.save(self.model.state_dict(), minimal_path)
+                self.logger.info(f"Minimal checkpoint saved to {minimal_path}")
+            except Exception as e2:
+                self.logger.error(f"Failed to save minimal checkpoint: {e2}")
     
     def _load_checkpoint(self, checkpoint_path: str) -> None:
         """Load a checkpoint.

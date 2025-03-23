@@ -1,48 +1,38 @@
-# src/utils/logger.py
-import logging
+"""Logging utilities."""
+
 import os
-from typing import Optional
+import logging
 
 
-def get_logger(name: str, 
-              level: int = logging.INFO, 
-              log_file: Optional[str] = None) -> logging.Logger:
-    """Get a logger with a specified name.
+def get_logger(name, log_file=None):
+    """Get a logger instance.
     
     Args:
-        name: Logger name
-        level: Logging level
-        log_file: Path to log file
+        name: Name of the logger
+        log_file: Path to log file (optional)
         
     Returns:
         Logger instance
     """
     # Create logger
     logger = logging.getLogger(name)
-    logger.setLevel(level)
-    
-    # Remove existing handlers
-    while logger.handlers:
-        logger.handlers.pop()
+    logger.setLevel(logging.INFO)
     
     # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
     # Create console handler
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     
-    # Create file handler if log file specified
+    # Create file handler if log file is specified
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(level)
+        file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     
-    return logger
+    return logger 

@@ -13,12 +13,9 @@ class OptimizerConfig:
 
 @dataclass
 class LRSchedulerConfig:
-    type: str = "step"
-    step_size: int = 8
-    gamma: float = 0.1
+    type: str = "multistep"
     milestones: List[int] = field(default_factory=lambda: [8, 11])
-    t_max: int = 100
-    eta_min: float = 0.0
+    gamma: float = 0.1
 
 
 @dataclass
@@ -61,7 +58,6 @@ class TrainingConfig:
     epochs: int = 12
     batch_size: int = 2
     workers: int = 4
-    gradient_accumulation_steps: int = 1
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
     data: DataConfig = field(default_factory=DataConfig)
