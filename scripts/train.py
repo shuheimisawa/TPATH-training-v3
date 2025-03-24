@@ -10,15 +10,11 @@ import traceback
 from src.config.model_config import ModelConfig
 from src.config.training_config import TrainingConfig
 from src.models.cascade_mask_rcnn import CascadeMaskRCNN
-from src.data.dataset import GlomeruliDataset
-from src.data.transforms import get_train_transforms, get_val_transforms
-from src.data.loader import create_dataloaders
+from src.data import GlomeruliDataset, get_train_transforms, get_val_transforms, create_dataloaders
 from src.training.trainer import Trainer
 from src.training.callbacks import ModelCheckpoint, EarlyStopping
 from src.utils.logger import get_logger
 from src.utils.io import load_yaml
-from src.utils.distributed import setup_distributed, cleanup_distributed, run_distributed
-# Import the DirectML adapter
 from src.utils.directml_adapter import get_dml_device, is_available
 
 
@@ -37,8 +33,6 @@ def parse_args():
                         help='Path to checkpoint to resume from')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID to use')
-    parser.add_argument('--distributed', action='store_true',
-                        help='Use distributed training')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     
@@ -93,21 +87,10 @@ def create_model(config, device, checkpoint_path=None):
     return model
 
 
-def train_worker(rank, args, model_config, config, device=None):
-    """Training worker function for distributed training."""
-    # Setup distributed training if needed
-    if args.distributed:
-        if is_available():
-            # DirectML doesn't fully support distributed training
-            print("Warning: Distributed training not fully supported with DirectML. Using single GPU mode.")
-            args.distributed = False
-            config.distributed = False
-        else:
-            setup_distributed(rank, len(config.gpu_ids))
-            device = torch.device(f"cuda:{rank}")
-    
+def train_worker(args, model_config, config, device=None):
+    """Training worker function."""
     # Get logger
-    logger = get_logger(name=f"train_worker_{rank}")
+    logger = get_logger(name="train_worker")
     
     try:
         # Initialize device if not provided
@@ -126,20 +109,32 @@ def train_worker(rank, args, model_config, config, device=None):
         logger.info("Creating model")
         model = create_model(model_config, device, args.resume)
         
-        # Ensure parameters are synchronized before DDP wrapping
-        if args.distributed:
-            # Broadcast model parameters from rank 0
-            for param in model.parameters():
-                torch.distributed.broadcast(param.data, 0)
-        
-        # Wrap model with DDP if distributed
-        if args.distributed:
-            from torch.nn.parallel import DistributedDataParallel as DDP
-            model = DDP(model, device_ids=[rank])
-        
         # Create data loaders
         logger.info("Creating dataloaders")
-        dataloaders = create_dataloaders(config, distributed=args.distributed)
+        # Convert config to dict format for dataloaders
+        config_dict = {
+            'transforms': {
+                'train': {
+                    'use_augmentation': config.data.use_augmentation,
+                    'augmentations': config.data.augmentations,
+                    'mean': config.data.mean,
+                    'std': config.data.std
+                },
+                'val': {
+                    'mean': config.data.mean,
+                    'std': config.data.std
+                }
+            },
+            'data': {
+                'train_dir': config.data.train_path,
+                'val_dir': config.data.val_path
+            },
+            'training': {
+                'batch_size': config.batch_size,
+                'num_workers': config.workers
+            }
+        }
+        dataloaders = create_dataloaders(config_dict, distributed=False)
         
         # Create callbacks
         callbacks = []
@@ -182,20 +177,13 @@ def train_worker(rank, args, model_config, config, device=None):
         logger.info("Training completed")
         
         # Log training summary
-        if rank == 0 or not args.distributed:
-            logger.info(f"Best validation mAP: {training_summary['best_val_map']:.4f}")
-            logger.info(f"Total training time: {training_summary['total_training_time']}")
+        logger.info(f"Best validation mAP: {training_summary['best_val_map']:.4f}")
+        logger.info(f"Total training time: {training_summary['total_training_time']}")
     
     except Exception as e:
         logger.error(f"Training error: {e}")
         logger.error(traceback.format_exc())
-        if args.distributed:
-            cleanup_distributed()
         raise
-    
-    # Clean up distributed training
-    if args.distributed:
-        cleanup_distributed()
 
 
 def main():
@@ -227,51 +215,36 @@ def main():
             logger.error(f"Failed to load config: {e}")
             return 1
         
-        # Create configuration objects and populate from YAML
+        # Create model and training configs
         model_config = ModelConfig()
-        training_config = TrainingConfig()
+        config = TrainingConfig()
         
-        # Update model config with values from YAML using the new function
-        update_config_from_dict(model_config, config_dict.get('model', {}))
+        # Update configs from YAML
+        if 'model' in config_dict:
+            update_config_from_dict(model_config, config_dict['model'])
+        if 'training' in config_dict:
+            update_config_from_dict(config, config_dict['training'])
         
-        # Update training config with values from YAML using the new function
-        update_config_from_dict(training_config, config_dict.get('training', {}))
-        
-        # Update config with command line arguments
-        training_config.checkpoint_dir = args.checkpoint_dir
-        training_config.log_dir = args.log_dir
-        training_config.seed = args.seed
-        training_config.distributed = args.distributed
+        # Update paths from arguments
+        config.data.train_path = os.path.join(args.data_dir, 'train')
+        config.data.val_path = os.path.join(args.data_dir, 'val')
+        config.checkpoint_dir = args.checkpoint_dir
+        config.log_dir = args.log_dir
         
         # Create directories
-        os.makedirs(training_config.checkpoint_dir, exist_ok=True)
-        os.makedirs(training_config.log_dir, exist_ok=True)
+        os.makedirs(config.checkpoint_dir, exist_ok=True)
+        os.makedirs(config.log_dir, exist_ok=True)
         
-        # Check if DirectML is available and disable distributed training if using DirectML
-        if is_available():
-            logger.info("DirectML is available")
-            device = get_dml_device(args.gpu)
-            logger.info(f"Using DirectML device: {device}")
-        else:
-            logger.info("DirectML is not available, falling back to CPU")
-            device = torch.device('cpu')
-            logger.info(f"Using device: {device}")
-        
-        # Disable distributed training for now as it's not fully supported
-        args.distributed = False
-        training_config.distributed = False
-        
-        # Call training function directly
-        train_worker(0, args, model_config, training_config, device=device)
+        # Start training
+        train_worker(args, model_config, config)
         
         return 0
     
     except Exception as e:
-        print(f"Critical error: {e}")
-        print(traceback.format_exc())
+        logger.error(f"Training failed: {e}")
+        logger.error(traceback.format_exc())
         return 1
 
 
 if __name__ == '__main__':
-    exit_code = main()
-    sys.exit(exit_code)
+    sys.exit(main())

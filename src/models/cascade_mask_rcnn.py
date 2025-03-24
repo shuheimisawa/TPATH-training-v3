@@ -1,4 +1,5 @@
 # src/models/cascade_mask_rcnn.py
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,13 +8,127 @@ import torchvision
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
-from torchvision.ops import MultiScaleRoIAlign
+from torchvision.ops import MultiScaleRoIAlign, box_iou, clip_boxes_to_image, nms as box_nms
+from torchvision.models.detection.box_ops import box_iou
 
 from .backbones.resnet import ResNetBackbone
 from .components.fpn import FPN
 from .components.bifpn import BiFPN
 from .components.attention import SelfAttention, CBAM
+from .components.box_head import CascadeBoxHead, CascadeBoxPredictor
+from .components.mask_head import MaskRCNNHeadWithAttention
 from ..config.model_config import ModelConfig
+
+
+class BoxCoder:
+    """Box coder for converting between box formats."""
+    
+    def __init__(self, weights=(10., 10., 5., 5.)):
+        """Initialize box coder.
+        
+        Args:
+            weights: Box regression weights
+        """
+        self.weights = weights
+    
+    def encode(self, reference_boxes, proposals):
+        """Encode boxes relative to proposals.
+        
+        Args:
+            reference_boxes: Ground truth boxes
+            proposals: Anchor/proposal boxes
+            
+        Returns:
+            Box deltas
+        """
+        ex_widths = proposals[:, 2] - proposals[:, 0]
+        ex_heights = proposals[:, 3] - proposals[:, 1]
+        ex_ctr_x = proposals[:, 0] + 0.5 * ex_widths
+        ex_ctr_y = proposals[:, 1] + 0.5 * ex_heights
+
+        gt_widths = reference_boxes[:, 2] - reference_boxes[:, 0]
+        gt_heights = reference_boxes[:, 3] - reference_boxes[:, 1]
+        gt_ctr_x = reference_boxes[:, 0] + 0.5 * gt_widths
+        gt_ctr_y = reference_boxes[:, 1] + 0.5 * gt_heights
+
+        wx, wy, ww, wh = self.weights
+        targets_dx = wx * (gt_ctr_x - ex_ctr_x) / ex_widths
+        targets_dy = wy * (gt_ctr_y - ex_ctr_y) / ex_heights
+        targets_dw = ww * torch.log(gt_widths / ex_widths)
+        targets_dh = wh * torch.log(gt_heights / ex_heights)
+
+        targets = torch.stack((targets_dx, targets_dy, targets_dw, targets_dh), dim=1)
+        return targets
+
+    def decode(self, rel_codes, boxes):
+        """Decode relative codes to boxes.
+        
+        Args:
+            rel_codes: Box deltas
+            boxes: Reference boxes
+            
+        Returns:
+            Decoded boxes
+        """
+        boxes = boxes.to(rel_codes.dtype)
+
+        TO_REMOVE = 1  # TODO remove
+        widths = boxes[:, 2] - boxes[:, 0] + TO_REMOVE
+        heights = boxes[:, 3] - boxes[:, 1] + TO_REMOVE
+        ctr_x = boxes[:, 0] + 0.5 * widths
+        ctr_y = boxes[:, 1] + 0.5 * heights
+
+        wx, wy, ww, wh = self.weights
+        
+        # Handle different input shapes
+        if rel_codes.shape[-1] == 4:
+            dx = rel_codes[:, 0] / wx
+            dy = rel_codes[:, 1] / wy
+            dw = rel_codes[:, 2] / ww
+            dh = rel_codes[:, 3] / wh
+        else:
+            dx = rel_codes[:, 0::4] / wx
+            dy = rel_codes[:, 1::4] / wy
+            dw = rel_codes[:, 2::4] / ww
+            dh = rel_codes[:, 3::4] / wh
+
+        # Prevent sending too large values into torch.exp()
+        dw = torch.clamp(dw, max=math.log(1000. / 16))
+        dh = torch.clamp(dh, max=math.log(1000. / 16))
+
+        # Handle different input shapes
+        if rel_codes.shape[-1] == 4:
+            pred_ctr_x = dx * widths + ctr_x
+            pred_ctr_y = dy * heights + ctr_y
+            pred_w = torch.exp(dw) * widths
+            pred_h = torch.exp(dh) * heights
+
+            pred_boxes = torch.zeros_like(rel_codes)
+            # x1
+            pred_boxes[:, 0] = pred_ctr_x - 0.5 * pred_w
+            # y1
+            pred_boxes[:, 1] = pred_ctr_y - 0.5 * pred_h
+            # x2
+            pred_boxes[:, 2] = pred_ctr_x + 0.5 * pred_w - 1
+            # y2
+            pred_boxes[:, 3] = pred_ctr_y + 0.5 * pred_h - 1
+        else:
+            pred_ctr_x = dx * widths[:, None] + ctr_x[:, None]
+            pred_ctr_y = dy * heights[:, None] + ctr_y[:, None]
+            pred_w = torch.exp(dw) * widths[:, None]
+            pred_h = torch.exp(dh) * heights[:, None]
+
+            pred_boxes = torch.zeros_like(rel_codes)
+            # x1
+            pred_boxes[:, 0::4] = pred_ctr_x - 0.5 * pred_w
+            # y1
+            pred_boxes[:, 1::4] = pred_ctr_y - 0.5 * pred_h
+            # x2
+            pred_boxes[:, 2::4] = pred_ctr_x + 0.5 * pred_w - 1
+            # y2
+            pred_boxes[:, 3::4] = pred_ctr_y + 0.5 * pred_h - 1
+
+        return pred_boxes
 
 
 class CascadeMaskRCNN(nn.Module):
@@ -28,6 +143,17 @@ class CascadeMaskRCNN(nn.Module):
         super(CascadeMaskRCNN, self).__init__()
         
         self.config = config
+        
+        # Initialize box coder
+        self.box_coder = BoxCoder()
+        
+        # Image normalization and size transformation
+        self.transform = GeneralizedRCNNTransform(
+            min_size=800,
+            max_size=1333,
+            image_mean=[0.485, 0.456, 0.406],
+            image_std=[0.229, 0.224, 0.225]
+        )
         
         # Build backbone
         self.backbone = ResNetBackbone(
@@ -57,14 +183,6 @@ class CascadeMaskRCNN(nn.Module):
                 add_extra_convs=config.fpn.add_extra_convs,
                 extra_convs_on_inputs=config.fpn.extra_convs_on_inputs
             )
-        
-        # Image normalization and size transformation
-        self.transform = GeneralizedRCNNTransform(
-            min_size=800,
-            max_size=1333,
-            image_mean=[0.485, 0.456, 0.406],
-            image_std=[0.229, 0.224, 0.225]
-        )
         
         # Anchor generator
         anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
@@ -200,157 +318,276 @@ class CascadeMaskRCNN(nn.Module):
         losses = {}
         detections = []
         
+        # Check if we have any valid proposals
+        has_valid_proposals = any(len(p) > 0 for p in proposals)
+        
+        if not has_valid_proposals:
+            # Return empty results
+            if is_training:
+                losses.update(rpn_losses)
+                losses.update({
+                    'stage_0': torch.tensor(0.0, device=images.tensors.device),
+                    'stage_1': torch.tensor(0.0, device=images.tensors.device),
+                    'stage_2': torch.tensor(0.0, device=images.tensors.device),
+                    'mask_loss': torch.tensor(0.0, device=images.tensors.device)
+                })
+                return losses
+            else:
+                empty_detections = [{
+                    'boxes': torch.zeros((0, 4), device=images.tensors.device),
+                    'labels': torch.zeros((0,), dtype=torch.int64, device=images.tensors.device),
+                    'scores': torch.zeros((0,), device=images.tensors.device),
+                    'masks': torch.zeros((0, self.config.num_classes, *self.config.mask.roi_size), device=images.tensors.device)
+                } for _ in range(len(images))]
+                return empty_detections
+        
         if is_training:
             # Add RPN losses
             losses.update(rpn_losses)
             
-            # Cascade stages
-            all_stage_box_features = []
-            all_stage_predictions = []
-            all_stage_box_regression = []
-            all_stage_class_logits = []
-            
+            # Process each cascade stage
             for stage_idx in range(self.num_cascade_stages):
-                # Get IoU threshold for this stage
+                stage_dict = self.cascade_stages[stage_idx]
                 iou_thresh = self.cascade_iou_thresholds[stage_idx]
-                
-                # Use boxes from previous stage for stages > 0
-                if stage_idx > 0:
-                    # Update proposals with refined boxes from previous stage
-                    with torch.no_grad():
-                        # Create per-image proposals
-                        new_proposals = []
-                        for i, image_size in enumerate(images.image_sizes):
-                            # Get predictions for this image
-                            mask = all_stage_predictions[-1]['image_ids'] == i
-                            img_boxes = all_stage_predictions[-1]['boxes'][mask]
-                            new_proposals.append(img_boxes)
-                        proposals = new_proposals
                 
                 # Extract box features
                 box_features = self.box_roi_pool(feature_dict, proposals, images.image_sizes)
                 
-                # Process box features through box head
-                stage_dict = self.cascade_stages[stage_idx]
-                box_head = stage_dict['box_head']
-                box_predictor = stage_dict['box_predictor']
-                
-                box_features = box_head(box_features)
-                class_logits, box_regression = box_predictor(box_features)
-                
-                # Store features and predictions
-                all_stage_box_features.append(box_features)
-                all_stage_class_logits.append(class_logits)
-                all_stage_box_regression.append(box_regression)
-                
                 # Get predictions
-                predictions = {
-                    'boxes': proposals[0],
-                    'scores': F.softmax(class_logits, dim=-1)[:, 1:].max(dim=1)[0],
-                    'labels': F.softmax(class_logits, dim=-1)[:, 1:].max(dim=1)[1] + 1
-                }
-                all_stage_predictions.append(predictions)
+                box_features = stage_dict['box_head'](box_features)
+                class_logits, box_regression = stage_dict['box_predictor'](box_features)
                 
-                # Calculate and add box loss for this stage
-                stage_weight = self.cascade_loss_weights[stage_idx]
-                box_loss = F.smooth_l1_loss(box_regression, targets[0]['boxes'], reduction='sum')
-                cls_loss = F.cross_entropy(class_logits, targets[0]['labels'])
+                # Calculate losses for this stage
+                stage_loss = self.cascade_loss_weights[stage_idx] * self._compute_stage_loss(
+                    class_logits, box_regression, proposals, targets, iou_thresh
+                )
+                losses.update({f'stage_{stage_idx}': stage_loss})
                 
-                losses[f'stage{stage_idx}_box_loss'] = box_loss * stage_weight
-                losses[f'stage{stage_idx}_cls_loss'] = cls_loss * stage_weight
+                # Update proposals for next stage
+                if stage_idx < self.num_cascade_stages - 1:
+                    proposals = self._get_boxes_for_next_stage(
+                        box_regression, class_logits, proposals, images.image_sizes
+                    )
             
-            # Use boxes from the last stage
-            boxes = all_stage_predictions[-1]['boxes']
-            labels = all_stage_predictions[-1]['labels']
+            # Mask head forward pass
+            if len(proposals) > 0:
+                mask_features = self.mask_roi_pool(feature_dict, proposals, images.image_sizes)
+                mask_logits = self.mask_head(mask_features)
+                mask_loss = self._compute_mask_loss(mask_logits, proposals, targets)
+                losses.update({'mask_loss': mask_loss})
             
-            # Get mask features
-            mask_features = self.mask_roi_pool(feature_dict, [boxes], images.image_sizes)
-            
-            # Process mask features
-            mask_logits = self.mask_head(mask_features, labels)
-            
-            # Calculate mask loss
-            mask_loss = F.binary_cross_entropy_with_logits(mask_logits, targets[0]['masks'])
-            losses['mask_loss'] = mask_loss
+            # Calculate total loss
+            total_loss = sum(loss for loss in losses.values() if isinstance(loss, torch.Tensor))
+            losses['total_loss'] = total_loss
             
             return losses
         else:
             # Inference mode
-            # Similar to training but without loss calculation
-            # Use boxes from the last stage for mask prediction
-            predictions = []
+            detections = []
             
-            # Process each image independently (batch size is typically 1 during inference)
-            for idx, (image_size, image_proposals) in enumerate(zip(images.image_sizes, proposals)):
-                # Initialize boxes, scores, and labels
-                boxes = image_proposals
-                scores = torch.ones(boxes.shape[0], device=boxes.device)
-                labels = torch.ones(boxes.shape[0], dtype=torch.int64, device=boxes.device)
+            # Process each cascade stage
+            for stage_idx in range(self.num_cascade_stages):
+                stage_dict = self.cascade_stages[stage_idx]
                 
-                # Cascade stages
-                for stage_idx in range(self.num_cascade_stages):
-                    # Extract box features
-                    box_features = self.box_roi_pool(feature_dict, [boxes], [image_size])
-                    
-                    # Process box features through box head
-                    stage_dict = self.cascade_stages[stage_idx]
-                    box_head = stage_dict['box_head']
-                    box_predictor = stage_dict['box_predictor']
-                    
-                    box_features = box_head(box_features)
-                    class_logits, box_regression = box_predictor(box_features)
-                    
-                    # Update boxes, scores, and labels
-                    pred_boxes = self.apply_deltas_to_boxes(box_regression, boxes)
-                    pred_scores = F.softmax(class_logits, dim=-1)
-                    
-                    # Keep only predictions with score > threshold
-                    keep_idxs = pred_scores[:, 1:].max(dim=1)[0] > 0.05
-                    boxes = pred_boxes[keep_idxs]
-                    scores = pred_scores[keep_idxs, 1:].max(dim=1)[0]
-                    labels = pred_scores[keep_idxs, 1:].max(dim=1)[1] + 1
-                    
-                    if boxes.shape[0] == 0:
-                        # No detections
-                        result = {
-                            'boxes': torch.zeros((0, 4), device=boxes.device),
-                            'labels': torch.zeros(0, dtype=torch.int64, device=boxes.device),
-                            'scores': torch.zeros(0, device=boxes.device),
-                            'masks': torch.zeros((0, 1, *image_size), device=boxes.device)
-                        }
-                        predictions.append(result)
-                        continue
+                # Extract box features
+                box_features = self.box_roi_pool(feature_dict, proposals, images.image_sizes)
                 
-                # Get mask features for final boxes
-                mask_features = self.mask_roi_pool(feature_dict, [boxes], [image_size])
+                # Get predictions
+                box_features = stage_dict['box_head'](box_features)
+                class_logits, box_regression = stage_dict['box_predictor'](box_features)
                 
-                # Process mask features
-                mask_logits = self.mask_head(mask_features, labels)
-                
-                # Convert mask logits to binary masks
-                masks = (mask_logits > 0).float()
-                
-                # Resize masks to original image size
-                masks = self.resize_masks(masks, image_size, original_image_sizes[idx])
-                
-                # Apply NMS
-                keep = torchvision.ops.nms(boxes, scores, 0.5)
-                boxes = boxes[keep]
-                scores = scores[keep]
-                labels = labels[keep]
-                masks = masks[keep]
-                
-                # Create result dictionary
-                result = {
-                    'boxes': boxes,
-                    'labels': labels,
-                    'scores': scores,
-                    'masks': masks
-                }
-                
-                predictions.append(result)
+                # Update proposals for next stage
+                if stage_idx < self.num_cascade_stages - 1:
+                    proposals = self._get_boxes_for_next_stage(
+                        box_regression, class_logits, proposals, images.image_sizes
+                    )
             
-            return predictions
+            # Final detections
+            boxes = proposals[0]
+            scores = F.softmax(class_logits, dim=-1)[:, 1:].max(dim=1)[0]
+            labels = F.softmax(class_logits, dim=-1)[:, 1:].max(dim=1)[1] + 1
+            
+            # Get masks for final boxes
+            if len(boxes) > 0:
+                mask_features = self.mask_roi_pool(feature_dict, [boxes], images.image_sizes)
+                mask_logits = self.mask_head(mask_features)
+                masks = F.sigmoid(mask_logits)
+            else:
+                masks = torch.zeros((0, self.config.num_classes, *self.config.mask.roi_size), device=images.tensors.device)
+            
+            # Post-process detections
+            detections = [{
+                'boxes': boxes,
+                'labels': labels,
+                'scores': scores,
+                'masks': masks
+            }]
+            
+            detections = self.transform.postprocess(detections, images.image_sizes, original_image_sizes)
+            return detections
+            
+    def _compute_stage_loss(self, class_logits, box_regression, proposals, targets, iou_thresh):
+        """Compute loss for a single cascade stage.
+        
+        Args:
+            class_logits: Class predictions
+            box_regression: Box regression predictions
+            proposals: RPN proposals
+            targets: Ground truth targets
+            iou_thresh: IoU threshold for this stage
+            
+        Returns:
+            Total loss for this stage
+        """
+        # Match proposals to targets
+        matched_idxs = []
+        for proposals_in_image, targets_in_image in zip(proposals, targets):
+            if targets_in_image['boxes'].numel() == 0:
+                matched_idxs.append(
+                    torch.zeros(
+                        proposals_in_image.shape[0],
+                        dtype=torch.int64,
+                        device=proposals_in_image.device
+                    )
+                )
+                continue
+                
+            match_quality_matrix = box_iou(
+                targets_in_image['boxes'],
+                proposals_in_image
+            )
+            matched_vals, matches = match_quality_matrix.max(dim=0)
+            
+            # Assign background (negative) to below threshold matches
+            matches[matched_vals < iou_thresh] = -1
+            
+            matched_idxs.append(matches)
+        
+        # Compute classification loss
+        classification_loss = F.cross_entropy(
+            class_logits,
+            torch.cat([t['labels'][matched_idxs[i]] for i, t in enumerate(targets)])
+        )
+        
+        # Compute box regression loss
+        sampled_pos_inds_subset = torch.cat([matched_idxs[i] >= 0 for i in range(len(matched_idxs))])
+        labels_pos = torch.cat([t['labels'][matched_idxs[i]] for i, t in enumerate(targets)])
+        
+        if sampled_pos_inds_subset.sum() > 0:
+            box_regression_loss = F.smooth_l1_loss(
+                box_regression[sampled_pos_inds_subset],
+                torch.cat([t['boxes'][matched_idxs[i]] for i, t in enumerate(targets)])[sampled_pos_inds_subset],
+                reduction='sum'
+            ) / sampled_pos_inds_subset.sum()
+        else:
+            box_regression_loss = torch.tensor(0.0, device=class_logits.device)
+        
+        return classification_loss + box_regression_loss
+    
+    def _get_boxes_for_next_stage(self, box_regression, class_logits, proposals, image_sizes):
+        """Get refined boxes for the next cascade stage.
+        
+        Args:
+            box_regression: Box regression predictions
+            class_logits: Class predictions
+            proposals: Current proposals
+            image_sizes: Image sizes
+            
+        Returns:
+            List of refined boxes for each image
+        """
+        boxes = []
+        scores = F.softmax(class_logits, dim=-1)[:, 1:].max(dim=1)[0]
+        labels = F.softmax(class_logits, dim=-1)[:, 1:].max(dim=1)[1] + 1
+        
+        # Get start indices for each image's proposals
+        start_idx = 0
+        for i, (props, image_size) in enumerate(zip(proposals, image_sizes)):
+            num_props = len(props)
+            if num_props == 0:
+                boxes.append(torch.zeros((0, 4), device=props.device))
+                continue
+                
+            # Get regression deltas for this image's proposals
+            box_regression_per_image = box_regression[start_idx:start_idx + num_props]
+            
+            # Apply regression to proposals
+            refined_boxes = self.box_coder.decode(
+                box_regression_per_image,
+                props
+            )
+            
+            # Clip boxes to image size
+            refined_boxes = clip_boxes_to_image(refined_boxes, image_size)
+            
+            # Remove low scoring boxes
+            keep = torch.where(scores[start_idx:start_idx + num_props] > 0.05)[0]
+            refined_boxes = refined_boxes[keep]
+            scores_per_image = scores[start_idx:start_idx + num_props][keep]
+            
+            # Apply NMS
+            if len(refined_boxes) > 0:
+                keep = box_nms(refined_boxes, scores_per_image, 0.5)
+                refined_boxes = refined_boxes[keep]
+            
+            boxes.append(refined_boxes)
+            start_idx += num_props
+        
+        return boxes
+    
+    def _compute_mask_loss(self, mask_logits, proposals, targets):
+        """Compute mask loss.
+        
+        Args:
+            mask_logits: Predicted mask logits
+            proposals: RPN proposals
+            targets: Ground truth targets
+            
+        Returns:
+            Mask loss
+        """
+        if len(proposals) == 0:
+            return torch.tensor(0.0, device=mask_logits.device)
+        
+        matched_idxs = []
+        for proposals_in_image, targets_in_image in zip(proposals, targets):
+            if targets_in_image['boxes'].numel() == 0:
+                matched_idxs.append(
+                    torch.zeros(
+                        proposals_in_image.shape[0],
+                        dtype=torch.int64,
+                        device=proposals_in_image.device
+                    )
+                )
+                continue
+                
+            match_quality_matrix = box_iou(
+                targets_in_image['boxes'],
+                proposals_in_image
+            )
+            matched_vals, matches = match_quality_matrix.max(dim=0)
+            
+            # Assign background (negative) to below threshold matches
+            matches[matched_vals < 0.5] = -1
+            
+            matched_idxs.append(matches)
+        
+        # Get target masks
+        target_masks = torch.cat([t['masks'][matched_idxs[i]] for i, t in enumerate(targets)])
+        
+        # Compute mask loss only on positive samples
+        sampled_pos_inds_subset = torch.cat([matched_idxs[i] >= 0 for i in range(len(matched_idxs))])
+        
+        if sampled_pos_inds_subset.sum() > 0:
+            mask_loss = F.binary_cross_entropy_with_logits(
+                mask_logits[sampled_pos_inds_subset],
+                target_masks[sampled_pos_inds_subset],
+                reduction='mean'
+            )
+        else:
+            mask_loss = torch.tensor(0.0, device=mask_logits.device)
+        
+        return mask_loss
     
     def resize_masks(self, masks, orig_size, target_size):
         """Resize masks to target size."""
@@ -415,150 +652,3 @@ class CascadeMaskRCNN(nn.Module):
             pred_boxes[:, 3::4] = pred_ctr_y + 0.5 * pred_h
 
         return pred_boxes
-
-
-class CascadeBoxHead(nn.Module):
-    """Box head for Cascade R-CNN."""
-    
-    def __init__(self, in_channels, representation_size, roi_size):
-        """Initialize the box head.
-        
-        Args:
-            in_channels: Number of input channels
-            representation_size: Size of the intermediate representation
-            roi_size: Size of the RoI features
-        """
-        super(CascadeBoxHead, self).__init__()
-        
-        roi_height, roi_width = roi_size
-        
-        self.fc6 = nn.Linear(in_channels * roi_height * roi_width, representation_size)
-        self.fc7 = nn.Linear(representation_size, representation_size)
-    
-    def forward(self, x):
-        """Forward pass of the box head.
-        
-        Args:
-            x: RoI features
-            
-        Returns:
-            Box features
-        """
-        x = x.flatten(start_dim=1)
-        x = F.relu(self.fc6(x))
-        x = F.relu(self.fc7(x))
-        return x
-
-
-class CascadeBoxPredictor(nn.Module):
-    """Box predictor for Cascade R-CNN."""
-    
-    def __init__(self, in_channels, num_classes):
-        """Initialize the box predictor.
-        
-        Args:
-            in_channels: Number of input channels
-            num_classes: Number of classes including background
-        """
-        super(CascadeBoxPredictor, self).__init__()
-        
-        self.cls_score = nn.Linear(in_channels, num_classes)
-        self.bbox_pred = nn.Linear(in_channels, num_classes * 4)
-    
-    def forward(self, x):
-        """Forward pass of the box predictor.
-        
-        Args:
-            x: Box features
-            
-        Returns:
-            Class logits and box regression deltas
-        """
-        cls_scores = self.cls_score(x)
-        bbox_preds = self.bbox_pred(x)
-        
-        return cls_scores, bbox_preds
-
-
-class MaskRCNNHeadWithAttention(nn.Module):
-    """Enhanced Mask head for Mask R-CNN with attention."""
-    
-    def __init__(self, in_channels, layers, dilation, roi_size, num_classes, 
-                 use_attention=False, attention_type='self'):
-        """Initialize the mask head.
-        
-        Args:
-            in_channels: Number of input channels
-            layers: Number of channels in each convolutional layer
-            dilation: Dilation rate of the convolutional layers
-            roi_size: Size of the RoI features
-            num_classes: Number of classes including background
-            use_attention: Whether to use attention mechanism
-            attention_type: Type of attention to use ('self', 'cbam')
-        """
-        super(MaskRCNNHeadWithAttention, self).__init__()
-        
-        self.num_classes = num_classes
-        self.use_attention = use_attention
-        self.attention_type = attention_type
-        
-        # Build convolutional layers
-        self.conv_layers = nn.ModuleList()
-        next_channels = in_channels
-        
-        for layer_channels in layers:
-            self.conv_layers.append(
-                nn.Conv2d(
-                    next_channels,
-                    layer_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=dilation,
-                    dilation=dilation
-                )
-            )
-            next_channels = layer_channels
-        
-        # Add attention module if requested
-        if use_attention:
-            if attention_type == 'self':
-                self.attention = SelfAttention(next_channels)
-            elif attention_type == 'cbam':
-                self.attention = CBAM(next_channels)
-            else:
-                self.attention = None
-        
-        # Final layer
-        self.mask_predictor = nn.Conv2d(
-            next_channels,
-            num_classes,
-            kernel_size=1,
-            stride=1
-        )
-    
-    def forward(self, x, labels):
-        """Forward pass of the mask head.
-        
-        Args:
-            x: RoI features
-            labels: Class labels
-            
-        Returns:
-            Mask logits
-        """
-        for conv in self.conv_layers:
-            x = F.relu(conv(x))
-        
-        # Apply attention if enabled
-        if self.use_attention and hasattr(self, 'attention'):
-            x = self.attention(x)
-        
-        mask_logits = self.mask_predictor(x)
-        
-        if labels is not None:
-            # During training or inference with given labels
-            # Select the mask corresponding to the predicted class
-            mask_logits = mask_logits[torch.arange(mask_logits.shape[0], device=mask_logits.device), labels]
-            mask_logits = mask_logits.unsqueeze(1)
-        
-        return mask_logits

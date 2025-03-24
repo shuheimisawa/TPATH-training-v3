@@ -67,7 +67,7 @@ class TestGlomeruliDataset(unittest.TestCase):
         )
         
         self.assertEqual(len(dataset), 1)
-        self.assertEqual(dataset.CLASSES, ['background', 'GN', 'GL', 'GS'])
+        self.assertEqual(dataset.CLASSES, ['background', 'Normal', 'Partially_sclerotic', 'Sclerotic', 'Uncertain'])
     
     def test_dataset_getitem(self):
         """Test dataset __getitem__ method."""

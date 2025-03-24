@@ -32,7 +32,8 @@ class ResNetBackbone(nn.Module):
         
         # Create ResNet model
         model_func = getattr(torchvision.models, name)
-        resnet = model_func(pretrained=pretrained)
+        weights = torchvision.models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+        resnet = model_func(weights=weights)
         
         # Remove fully connected layer and average pooling
         self.resnet = nn.Sequential(

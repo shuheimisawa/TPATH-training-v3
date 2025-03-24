@@ -231,7 +231,7 @@ class Evaluator:
     
     def evaluate_classifications(self, predictions: List[Dict], targets: List[Dict]) -> Dict:
         """Evaluate classification performance per glomeruli type."""
-        class_names = ['GN', 'GL', 'GS']
+        class_names = ['Normal', 'Partially_sclerotic', 'Sclerotic', 'Uncertain']
         metrics_per_class = {}
         
         for class_idx, class_name in enumerate(class_names):
@@ -367,7 +367,7 @@ class Evaluator:
         Returns:
             Dictionary with error analysis
         """
-        class_names = ['background', 'GN', 'GL', 'GS']
+        class_names = ['background', 'Normal', 'Partially_sclerotic', 'Sclerotic', 'Uncertain']
         
         # Error analysis struct
         error_analysis = {
@@ -379,7 +379,7 @@ class Evaluator:
                 "medium": {"missed": 0, "false": 0, "misclassified": 0, "total": 0},
                 "large": {"missed": 0, "false": 0, "misclassified": 0, "total": 0}
             },
-            "confusion_matrix": np.zeros((4, 4), dtype=int)  # Including background
+            "confusion_matrix": np.zeros((5, 5), dtype=int)  # Including background
         }
         
         for idx, (pred, target) in enumerate(zip(predictions, targets)):

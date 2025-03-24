@@ -290,7 +290,12 @@ class Trainer:
                 losses = self.model(images, targets)
                 
                 # Calculate total loss
-                loss = sum(loss for loss in losses.values())
+                if isinstance(losses, dict):
+                    # Model returns a dictionary of losses
+                    loss = losses.get('total_loss', sum(loss for loss in losses.values() if isinstance(loss, torch.Tensor)))
+                else:
+                    # Model returns a single loss value
+                    loss = losses
                 
                 # Scale the loss for gradient accumulation
                 loss = loss / accumulation_steps
