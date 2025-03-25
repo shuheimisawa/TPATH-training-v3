@@ -9,6 +9,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
+import traceback
 from typing import Dict, List, Optional, Tuple
 
 from ..utils.logger import get_logger
@@ -162,6 +163,7 @@ class Trainer:
                     epoch_loss = self._train_epoch(epoch)
                 except Exception as e:
                     self.logger.error(f"Error in training epoch {epoch+1}: {e}")
+                    self.logger.error(traceback.format_exc())
                     # Save emergency checkpoint
                     self._save_checkpoint(epoch, is_emergency=True)
                     raise
@@ -195,6 +197,7 @@ class Trainer:
                             self.lr_scheduler.step(val_map)
                     except Exception as e:
                         self.logger.error(f"Error in validation epoch {epoch+1}: {e}")
+                        self.logger.error(traceback.format_exc())
                         # Use previous metrics or default values
                         val_map = self.val_map_history[-1] if self.val_map_history else 0.0
                         self.val_map_history.append(val_map)
@@ -226,6 +229,7 @@ class Trainer:
         
         except Exception as e:
             self.logger.error(f"Training interrupted: {e}")
+            self.logger.error(traceback.format_exc())
             # Save emergency checkpoint
             self._save_checkpoint(self.start_epoch + len(self.train_loss_history), is_emergency=True)
             raise
@@ -263,100 +267,58 @@ class Trainer:
             return training_summary
     
     def _train_epoch(self, epoch: int) -> float:
-        """Train for one epoch."""
+        """Train for one epoch.
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            Average loss for the epoch
+        """
         self.model.train()
+        total_loss = 0
+        num_batches = len(self.train_loader)
         
-        total_loss = 0.0
-        epoch_iterator = tqdm(self.train_loader, desc=f"Training (Epoch {epoch+1})")
+        # Create progress bar
+        pbar = tqdm(self.train_loader, desc=f"Training (Epoch {epoch})")
         
-        # Default accumulation steps (1 = no accumulation)
-        accumulation_steps = getattr(self.config, 'gradient_accumulation_steps', 1)
-        
-        for i, batch in enumerate(epoch_iterator):
+        for batch_idx, batch in enumerate(pbar):
             try:
-                # Call on_batch_begin for callbacks
-                batch_logs = {'batch': i, 'size': len(batch[0])}
-                for callback in self.callbacks:
-                    callback.on_batch_begin(i, batch_logs)
-                
-                # Get images and targets
-                images, targets = batch
+                # Handle both tuple and dictionary batch formats
+                if isinstance(batch, tuple) and len(batch) == 2:
+                    images, targets = batch
+                elif isinstance(batch, dict):
+                    images = batch['image']
+                    targets = batch['target']
+                else:
+                    raise ValueError(f"Unexpected batch format: {type(batch)}")
                 
                 # Move data to device
                 images = [img.to(self.device) for img in images]
-                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+                targets = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                          for k, v in t.items()} for t in targets]
                 
                 # Forward pass
-                losses = self.model(images, targets)
+                loss_dict = self.model(images, targets)
                 
                 # Calculate total loss
-                if isinstance(losses, dict):
-                    # Model returns a dictionary of losses
-                    loss = losses.get('total_loss', sum(loss for loss in losses.values() if isinstance(loss, torch.Tensor)))
-                else:
-                    # Model returns a single loss value
-                    loss = losses
-                
-                # Scale the loss for gradient accumulation
-                loss = loss / accumulation_steps
+                losses = sum(loss for loss in loss_dict.values())
                 
                 # Backward pass
-                loss.backward()
+                self.optimizer.zero_grad()
+                losses.backward()
+                self.optimizer.step()
                 
-                # Check for NaN loss
-                if torch.isnan(loss) or torch.isinf(loss):
-                    self.logger.error(f"NaN or Inf loss detected: {loss.item()}")
-                    self.logger.error(f"Loss breakdown: {losses}")
-                    raise RuntimeError("NaN or Inf loss detected")
+                # Update progress bar
+                total_loss += losses.item()
+                pbar.set_postfix({'loss': losses.item()})
                 
-                # Only update weights after accumulation_steps
-                if (i + 1) % accumulation_steps == 0:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                
-                # For logging, use the unscaled loss
-                batch_loss = loss.item() * accumulation_steps
-                total_loss += batch_loss
-                
-                # Update metrics display
-                current_lr = self.optimizer.param_groups[0]['lr']
-                epoch_iterator.set_postfix({
-                    'loss': batch_loss,
-                    'lr': current_lr
-                })
-                
-                self.global_step += 1
-                
-                # Update batch_logs for callbacks
-                batch_logs.update({
-                    'loss': batch_loss,
-                    'lr': current_lr
-                })
-                
-                # Call on_batch_end for callbacks
-                for callback in self.callbacks:
-                    callback.on_batch_end(i, batch_logs)
-                
-                # Log batch metrics
-                if i % self.config.log_freq == 0:
-                    self.logger.info(f"Epoch: {epoch+1}, Batch: {i}, Loss: {batch_loss:.4f}, LR: {current_lr:.6f}")
-                
-                # Clear GPU memory every few batches to prevent OOM
-                if i % 10 == 0:
-                    empty_cache()
-            
             except Exception as e:
-                self.logger.error(f"Error in batch {i} of epoch {epoch+1}: {e}")
-                # Skip this batch and continue with next
-                continue
+                self.logger.error(f"Error in batch {batch_idx} of epoch {epoch}: {e}")
+                self.logger.error(traceback.format_exc())
+                raise
         
-        # Calculate average loss
-        avg_loss = total_loss / max(1, len(self.train_loader))
-        self.logger.info(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
-        
-        return avg_loss
+        return total_loss / num_batches
     
     def _validate_epoch(self, epoch: int) -> Dict:
         """Validate the model on the validation set."""
@@ -368,12 +330,28 @@ class Trainer:
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc=f"Validation (Epoch {epoch+1})"):
                 try:
-                    # Get images and targets
-                    images, targets = batch
+                    # Check batch format - handle both tuple and dict formats
+                    if isinstance(batch, tuple) and len(batch) == 2:
+                        # Batch is already in (images, targets) format - common in PyTorch dataloaders
+                        images, targets = batch
+                    elif isinstance(batch, dict) and 'image' in batch and 'target' in batch:
+                        # Batch is in dictionary format
+                        images = batch['image']
+                        targets = batch['target']
+                    else:
+                        # Unknown format - log and skip
+                        self.logger.error(f"Unknown batch format: {type(batch)}")
+                        continue
                     
                     # Move data to device
-                    images = [img.to(self.device) for img in images]
-                    targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+                    if isinstance(images, list):
+                        images = [img.to(self.device) for img in images]
+                    else:
+                        images = images.to(self.device)
+                        
+                    # Handle targets - ensure they're in the expected format for your model
+                    if isinstance(targets, list):
+                        targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
                     
                     # Get predictions
                     predictions = self.model(images)
@@ -390,10 +368,13 @@ class Trainer:
                     all_predictions.extend(cpu_predictions)
                     all_targets.extend(cpu_targets)
                     
-                    # Clear GPU memory to avoid OOM
+                    # Clear memory every few batches for DirectML
+                    from src.utils.directml_adapter import empty_cache
                     empty_cache()
+                    
                 except Exception as e:
                     self.logger.error(f"Error in validation batch: {e}")
+                    self.logger.error(traceback.format_exc())
                     # Skip this batch and continue with next
                     continue
         
@@ -418,6 +399,8 @@ class Trainer:
         self.logger.info(f"Epoch {epoch+1} - Validation mAP: {metrics['mAP']:.4f}")
         
         # Clear GPU memory after validation
+        # Use DirectML's empty_cache function instead of CUDA's
+        from src.utils.directml_adapter import empty_cache
         empty_cache()
         
         return metrics
@@ -479,6 +462,7 @@ class Trainer:
                 
         except Exception as e:
             self.logger.error(f"Failed to save checkpoint: {e}")
+            self.logger.error(traceback.format_exc())
             # Try to save a minimal checkpoint with just the model state
             try:
                 minimal_path = os.path.join(self.config.checkpoint_dir, f'minimal_epoch_{epoch+1}.pth')
@@ -516,17 +500,18 @@ class Trainer:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             
             # Load LR scheduler if available
-            if checkpoint['lr_scheduler_state_dict'] and self.lr_scheduler:
+            if 'lr_scheduler_state_dict' in checkpoint and checkpoint['lr_scheduler_state_dict'] and self.lr_scheduler:
                 self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
             
             # Load training state
-            self.start_epoch = checkpoint['epoch'] + 1
-            self.best_val_map = checkpoint['best_val_map']
-            self.global_step = checkpoint['global_step']
-            self.train_loss_history = checkpoint['train_loss_history']
+            self.start_epoch = checkpoint.get('epoch', 0) + 1
+            self.best_val_map = checkpoint.get('best_val_map', 0.0)
+            self.global_step = checkpoint.get('global_step', 0)
+            self.train_loss_history = checkpoint.get('train_loss_history', [])
             self.val_map_history = checkpoint.get('val_map_history', [])
             
-            self.logger.info(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+            self.logger.info(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 0)}")
         except Exception as e:
             self.logger.error(f"Failed to load checkpoint: {e}")
+            self.logger.error(traceback.format_exc())
             raise

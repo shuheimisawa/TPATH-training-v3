@@ -126,6 +126,7 @@ def train_worker(args, model_config, config, device=None):
                 }
             },
             'data': {
+                # Make sure these keys match what loader.py is expecting
                 'train_dir': config.data.train_path,
                 'val_dir': config.data.val_path
             },
@@ -134,6 +135,10 @@ def train_worker(args, model_config, config, device=None):
                 'num_workers': config.workers
             }
         }
+        
+        # Print the config_dict for debugging
+        logger.info(f"Data directory config: {config_dict['data']}")
+        
         dataloaders = create_dataloaders(config_dict, distributed=False)
         
         # Create callbacks
@@ -226,8 +231,12 @@ def main():
             update_config_from_dict(config, config_dict['training'])
         
         # Update paths from arguments
-        config.data.train_path = os.path.join(args.data_dir, 'train')
-        config.data.val_path = os.path.join(args.data_dir, 'val')
+        if args.data_dir:
+            # Use the data directory as is, since it already contains 'processed'
+            config.data.train_path = os.path.join(args.data_dir, 'train')
+            config.data.val_path = os.path.join(args.data_dir, 'val')
+            config.data.test_path = os.path.join(args.data_dir, 'test')
+        
         config.checkpoint_dir = args.checkpoint_dir
         config.log_dir = args.log_dir
         

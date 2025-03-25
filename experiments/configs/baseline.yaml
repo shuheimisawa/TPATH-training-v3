@@ -24,18 +24,18 @@ model:
     target_stds: [1.0, 1.0, 1.0, 1.0]
     feat_channels: 256
     use_sigmoid_cls: true
-    nms_pre: 2000
-    nms_post: 2000
+    nms_pre: 1000
+    nms_post: 1000
     nms_thr: 0.7
     min_bbox_size: 0
-    num_max_proposals: 2000
+    num_max_proposals: 1000
   
   roi:
     roi_layer:
       type: 'RoIAlign'
-      out_size: [7, 7]
+      out_size: [5, 5]
       sample_num: 2
-    roi_size: [7, 7]
+    roi_size: [5, 5]
     roi_sample_num: 2
     target_means: [0.0, 0.0, 0.0, 0.0]
     target_stds: [0.1, 0.1, 0.2, 0.2]
@@ -52,7 +52,7 @@ model:
     iou_thresholds: [0.5, 0.6, 0.7]
   
   mask:
-    roi_size: [14, 14]
+    roi_size: [10, 10]
     in_channels: 256
     conv_kernel_size: 1
     classes: 5  # background + 4 classes (Normal, Sclerotic, Partially_sclerotic, Uncertain)
@@ -64,8 +64,8 @@ model:
 training:
   seed: 42
   epochs: 12
-  batch_size: 2
-  workers: 4
+  batch_size: 1
+  workers: 2
   
   optimizer:
     type: 'SGD'
@@ -107,9 +107,6 @@ training:
       random_gamma:
         p: 0.5
         gamma_limit: [80, 120]
-      gauss_noise:
-        p: 0.5
-        var_limit: [10.0, 50.0]
       elastic_transform:
         p: 0.5
         alpha: 120.0

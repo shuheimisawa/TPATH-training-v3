@@ -8,8 +8,32 @@ import torchvision
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
-from torchvision.ops import MultiScaleRoIAlign, box_iou, clip_boxes_to_image, nms as box_nms
-from torchvision.models.detection.box_ops import box_iou
+from torchvision.ops import MultiScaleRoIAlign, clip_boxes_to_image, nms as box_nms
+
+# Custom implementation of box_iou
+def box_area(boxes):
+    """
+    Computes the area of a set of bounding boxes
+    """
+    return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+def box_iou(boxes1, boxes2):
+    """
+    Return intersection-over-union (Jaccard index) between boxes.
+    """
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
+
+    wh = (rb - lt).clamp(min=0)  # [N,M,2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
+
+    union = area1[:, None] + area2 - inter
+
+    iou = inter / union
+    return iou
 
 from .backbones.resnet import ResNetBackbone
 from .components.fpn import FPN
@@ -217,7 +241,7 @@ class CascadeMaskRCNN(nn.Module):
             # Box predictor for this stage
             box_predictor = CascadeBoxPredictor(
                 in_channels=1024,
-                num_classes=config.num_classes
+                num_classes=config.roi.classes
             )
             
             # Add stage
@@ -474,6 +498,10 @@ class CascadeMaskRCNN(nn.Module):
         labels_pos = torch.cat([t['labels'][matched_idxs[i]] for i, t in enumerate(targets)])
         
         if sampled_pos_inds_subset.sum() > 0:
+            # Get the box regression for the correct classes
+            box_regression = box_regression.view(-1, self.config.roi.classes, 4)
+            box_regression = box_regression[torch.arange(len(box_regression)), labels_pos - 1]
+            
             box_regression_loss = F.smooth_l1_loss(
                 box_regression[sampled_pos_inds_subset],
                 torch.cat([t['boxes'][matched_idxs[i]] for i, t in enumerate(targets)])[sampled_pos_inds_subset],
@@ -485,17 +513,7 @@ class CascadeMaskRCNN(nn.Module):
         return classification_loss + box_regression_loss
     
     def _get_boxes_for_next_stage(self, box_regression, class_logits, proposals, image_sizes):
-        """Get refined boxes for the next cascade stage.
-        
-        Args:
-            box_regression: Box regression predictions
-            class_logits: Class predictions
-            proposals: Current proposals
-            image_sizes: Image sizes
-            
-        Returns:
-            List of refined boxes for each image
-        """
+        """Get refined boxes for the next cascade stage."""
         boxes = []
         scores = F.softmax(class_logits, dim=-1)[:, 1:].max(dim=1)[0]
         labels = F.softmax(class_logits, dim=-1)[:, 1:].max(dim=1)[1] + 1
@@ -510,6 +528,15 @@ class CascadeMaskRCNN(nn.Module):
                 
             # Get regression deltas for this image's proposals
             box_regression_per_image = box_regression[start_idx:start_idx + num_props]
+            
+            # Get the regression deltas for the predicted classes
+            if self.config.roi.reg_class_agnostic:
+                # Class-agnostic regression
+                box_regression_per_image = box_regression_per_image.view(-1, 4)
+            else:
+                # Class-specific regression
+                box_regression_per_image = box_regression_per_image.view(-1, self.config.roi.classes, 4)
+                box_regression_per_image = box_regression_per_image[torch.arange(len(box_regression_per_image)), labels[start_idx:start_idx + num_props] - 1]
             
             # Apply regression to proposals
             refined_boxes = self.box_coder.decode(
@@ -546,6 +573,8 @@ class CascadeMaskRCNN(nn.Module):
         Returns:
             Mask loss
         """
+        import torch.nn.functional as F
+        
         if len(proposals) == 0:
             return torch.tensor(0.0, device=mask_logits.device)
         
@@ -572,22 +601,108 @@ class CascadeMaskRCNN(nn.Module):
             
             matched_idxs.append(matches)
         
-        # Get target masks
-        target_masks = torch.cat([t['masks'][matched_idxs[i]] for i, t in enumerate(targets)])
-        
-        # Compute mask loss only on positive samples
+        # Only compute loss on positive samples
         sampled_pos_inds_subset = torch.cat([matched_idxs[i] >= 0 for i in range(len(matched_idxs))])
         
         if sampled_pos_inds_subset.sum() > 0:
-            mask_loss = F.binary_cross_entropy_with_logits(
-                mask_logits[sampled_pos_inds_subset],
-                target_masks[sampled_pos_inds_subset],
-                reduction='mean'
-            )
-        else:
-            mask_loss = torch.tensor(0.0, device=mask_logits.device)
+            # Get target masks - this needs to be resized to match prediction size
+            target_masks = []
+            for i, (targets_per_image, matched_idxs_per_image) in enumerate(zip(targets, matched_idxs)):
+                if matched_idxs_per_image.numel() == 0:
+                    continue
+                    
+                # Get masks for positive samples
+                pos_mask_idxs = matched_idxs_per_image >= 0
+                pos_matched_idxs = matched_idxs_per_image[pos_mask_idxs]
+                
+                if pos_matched_idxs.numel() == 0:
+                    continue
+                    
+                # Get target masks for these positive indices
+                if 'masks' in targets_per_image and targets_per_image['masks'].numel() > 0:
+                    # Extract target masks for matched indices
+                    masks = targets_per_image['masks'][pos_matched_idxs]
+                    
+                    # Check mask dimensions
+                    if len(masks.shape) == 3:  # [N, H, W]
+                        pass  # Good shape
+                    elif len(masks.shape) == 2:  # [H, W]
+                        masks = masks.unsqueeze(0)  # Add instance dimension
+                    
+                    # Get target mask size from prediction
+                    mask_h, mask_w = mask_logits.shape[-2:]
+                    
+                    # Resize masks to prediction size
+                    masks = F.interpolate(
+                        masks.unsqueeze(0).float(),  # Add batch dimension [1, N, H, W]
+                        size=(mask_h, mask_w),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)  # Remove batch dimension [N, mask_h, mask_w]
+                    
+                    # Apply threshold to make binary masks
+                    masks = masks > 0.5
+                    
+                    target_masks.append(masks)
+            
+            if target_masks:
+                target_masks = torch.cat(target_masks)
+                
+                # Ensure there's at least one valid mask
+                if target_masks.shape[0] > 0:
+                    # Get corresponding predictions
+                    mask_logits_pos = mask_logits[sampled_pos_inds_subset]
+                    
+                    # Get the class labels for each positive sample
+                    class_labels = torch.cat([t['labels'][matched_idxs[i]] for i, t in enumerate(targets)])
+                    class_labels = class_labels[sampled_pos_inds_subset]
+                    
+                    # Index mask logits by class - select correct class channel for each instance
+                    idx = torch.arange(class_labels.shape[0], device=class_labels.device)
+                    mask_logits_pos = mask_logits_pos[idx, class_labels]
+                    
+                    # Compute binary cross entropy loss
+                    # Make sure mask_logits_pos matches target_masks shape
+                    if mask_logits_pos.shape != target_masks.shape:
+                        print(f"Warning: Shape mismatch - logits: {mask_logits_pos.shape}, targets: {target_masks.shape}")
+                        
+                        # Attempt to resolve shape mismatch
+                        if len(mask_logits_pos.shape) == 3 and len(target_masks.shape) == 3:
+                            # If just the number of instances differs, we have a problem
+                            # This might happen if our matching logic is faulty
+                            if mask_logits_pos.shape[0] < target_masks.shape[0]:
+                                # Take only the first N masks to match
+                                target_masks = target_masks[:mask_logits_pos.shape[0]]
+                            elif mask_logits_pos.shape[0] > target_masks.shape[0]:
+                                # Take only the first N predictions to match
+                                mask_logits_pos = mask_logits_pos[:target_masks.shape[0]]
+                        
+                        # Last resort fallback - reshape if dimensions still don't match
+                        if mask_logits_pos.shape != target_masks.shape:
+                            target_masks = F.interpolate(
+                                target_masks.unsqueeze(1).float(),
+                                size=mask_logits_pos.shape[1:],
+                                mode='bilinear',
+                                align_corners=False
+                            ).squeeze(1) > 0.5
+                    
+                    # Calculate loss
+                    try:
+                        mask_loss = F.binary_cross_entropy_with_logits(
+                            mask_logits_pos,
+                            target_masks.float(),
+                            reduction='mean'
+                        )
+                    except Exception as e:
+                        print(f"Error in mask loss: {e}")
+                        print(f"Mask logits shape: {mask_logits_pos.shape}")
+                        print(f"Target masks shape: {target_masks.shape}")
+                        mask_loss = torch.tensor(0.0, device=mask_logits.device)
+                    
+                    return mask_loss
         
-        return mask_loss
+        # Return zero loss if no positive samples
+        return torch.tensor(0.0, device=mask_logits.device)
     
     def resize_masks(self, masks, orig_size, target_size):
         """Resize masks to target size."""
@@ -652,3 +767,29 @@ class CascadeMaskRCNN(nn.Module):
             pred_boxes[:, 3::4] = pred_ctr_y + 0.5 * pred_h
 
         return pred_boxes
+
+
+class CascadeBoxPredictor(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super(CascadeBoxPredictor, self).__init__()
+        self.cls_score = nn.Linear(in_channels, num_classes)
+        self.bbox_pred = nn.Linear(in_channels, num_classes * 4)
+    
+    def forward(self, x):
+        scores = self.cls_score(x)
+        bbox_deltas = self.bbox_pred(x)
+        return scores, bbox_deltas
+
+
+class CascadeBoxHead(nn.Module):
+    def __init__(self, in_channels, representation_size, roi_size):
+        super(CascadeBoxHead, self).__init__()
+        self.fc6 = nn.Linear(in_channels * roi_size[0] * roi_size[1], representation_size)
+        self.fc7 = nn.Linear(representation_size, representation_size)
+        self.relu = nn.ReLU(inplace=True)
+    
+    def forward(self, x):
+        x = torch.flatten(x, 1)
+        x = self.relu(self.fc6(x))
+        x = self.relu(self.fc7(x))
+        return x

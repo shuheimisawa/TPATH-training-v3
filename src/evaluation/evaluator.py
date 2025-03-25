@@ -131,9 +131,10 @@ class Evaluator:
         
         # Categories (GN, GL, GS)
         categories = [
-            {"id": 1, "name": "GN", "supercategory": "glomeruli"},
-            {"id": 2, "name": "GL", "supercategory": "glomeruli"},
-            {"id": 3, "name": "GS", "supercategory": "glomeruli"}
+            {"id": 1, "name": "Normal", "supercategory": "glomeruli"},
+            {"id": 2, "name": "Partially_sclerotic", "supercategory": "glomeruli"},
+            {"id": 3, "name": "Sclerotic", "supercategory": "glomeruli"},
+            {"id": 4, "name": "Uncertain", "supercategory": "glomeruli"}
         ]
         
         # Create a unique annotation ID
@@ -142,11 +143,23 @@ class Evaluator:
         for idx, item in enumerate(data):
             # Create image entry
             image_id = idx + 1
+            
+            # Get image dimensions, handling both tensor and non-tensor cases
+            if "orig_size" in item:
+                orig_size = item["orig_size"]
+                if isinstance(orig_size, torch.Tensor):
+                    height = orig_size[0].item()
+                    width = orig_size[1].item()
+                else:
+                    height, width = orig_size
+            else:
+                height, width = 1000, 1000  # Default size
+            
             images.append({
                 "id": image_id,
-                "width": item.get("orig_size", [0, 0])[1].item() if "orig_size" in item else 1000,
-                "height": item.get("orig_size", [0, 0])[0].item() if "orig_size" in item else 1000,
-                "file_name": f"image_{image_id}.jpg"
+                "width": width,
+                "height": height,
+                "file_name": item.get("image_id", f"image_{image_id}.jpg")
             })
             
             if is_gt:
@@ -155,10 +168,18 @@ class Evaluator:
                 labels = item.get("labels", [])
                 masks = item.get("masks", [])
                 
+                # Convert to tensor if not already
+                if not isinstance(boxes, torch.Tensor):
+                    boxes = torch.tensor(boxes)
+                if not isinstance(labels, torch.Tensor):
+                    labels = torch.tensor(labels)
+                if not isinstance(masks, torch.Tensor):
+                    masks = torch.tensor(masks)
+                
                 for box_idx in range(len(boxes)):
                     box = boxes[box_idx].cpu().tolist()
-                    label = labels[box_idx].item()
-                    mask = masks[box_idx].cpu().numpy() if masks.size(0) > 0 else None
+                    label = labels[box_idx].item() if isinstance(labels[box_idx], torch.Tensor) else labels[box_idx]
+                    mask = masks[box_idx].cpu().numpy() if isinstance(masks, torch.Tensor) and masks.size(0) > 0 else None
                     
                     # Convert box from [x1, y1, x2, y2] to [x, y, width, height]
                     x1, y1, x2, y2 = box
@@ -191,11 +212,21 @@ class Evaluator:
                 scores = item.get("scores", [])
                 masks = item.get("masks", [])
                 
+                # Convert to tensor if not already
+                if not isinstance(boxes, torch.Tensor):
+                    boxes = torch.tensor(boxes)
+                if not isinstance(labels, torch.Tensor):
+                    labels = torch.tensor(labels)
+                if not isinstance(scores, torch.Tensor):
+                    scores = torch.tensor(scores)
+                if not isinstance(masks, torch.Tensor):
+                    masks = torch.tensor(masks)
+                
                 for box_idx in range(len(boxes)):
                     box = boxes[box_idx].cpu().tolist()
-                    label = labels[box_idx].item()
-                    score = scores[box_idx].item()
-                    mask = masks[box_idx].cpu().numpy() if len(masks) > 0 else None
+                    label = labels[box_idx].item() if isinstance(labels[box_idx], torch.Tensor) else labels[box_idx]
+                    score = scores[box_idx].item() if isinstance(scores[box_idx], torch.Tensor) else scores[box_idx]
+                    mask = masks[box_idx].cpu().numpy() if isinstance(masks, torch.Tensor) and len(masks) > 0 else None
                     
                     # Convert box from [x1, y1, x2, y2] to [x, y, width, height]
                     x1, y1, x2, y2 = box
