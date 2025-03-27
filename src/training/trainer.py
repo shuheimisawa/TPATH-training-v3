@@ -332,14 +332,11 @@ class Trainer:
                 try:
                     # Check batch format - handle both tuple and dict formats
                     if isinstance(batch, tuple) and len(batch) == 2:
-                        # Batch is already in (images, targets) format - common in PyTorch dataloaders
                         images, targets = batch
                     elif isinstance(batch, dict) and 'image' in batch and 'target' in batch:
-                        # Batch is in dictionary format
                         images = batch['image']
                         targets = batch['target']
                     else:
-                        # Unknown format - log and skip
                         self.logger.error(f"Unknown batch format: {type(batch)}")
                         continue
                     
@@ -349,7 +346,7 @@ class Trainer:
                     else:
                         images = images.to(self.device)
                         
-                    # Handle targets - ensure they're in the expected format for your model
+                    # Handle targets
                     if isinstance(targets, list):
                         targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
                     
@@ -360,8 +357,15 @@ class Trainer:
                     cpu_targets = [{k: v.cpu() for k, v in t.items()} for t in targets]
                     cpu_predictions = []
                     for pred in predictions:
-                        cpu_pred = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
-                                for k, v in pred.items()}
+                        cpu_pred = {}
+                        for k, v in pred.items():
+                            if k == 'masks' and isinstance(v, torch.Tensor):
+                                # Convert float masks to binary uint8 masks
+                                # First threshold at 0.5, then convert to uint8
+                                v = (v > 0.5).to(torch.uint8)
+                            if isinstance(v, torch.Tensor):
+                                v = v.cpu()
+                            cpu_pred[k] = v
                         cpu_predictions.append(cpu_pred)
                     
                     # Store predictions and targets
@@ -369,7 +373,6 @@ class Trainer:
                     all_targets.extend(cpu_targets)
                     
                     # Clear memory every few batches for DirectML
-                    from src.utils.directml_adapter import empty_cache
                     empty_cache()
                     
                 except Exception as e:
@@ -399,8 +402,6 @@ class Trainer:
         self.logger.info(f"Epoch {epoch+1} - Validation mAP: {metrics['mAP']:.4f}")
         
         # Clear GPU memory after validation
-        # Use DirectML's empty_cache function instead of CUDA's
-        from src.utils.directml_adapter import empty_cache
         empty_cache()
         
         return metrics
