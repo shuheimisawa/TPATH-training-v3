@@ -1,213 +1,119 @@
-# Glomeruli Detection and Classification
+# Glomeruli Training
 
-This repository contains code for an advanced pipeline for detecting and classifying glomeruli in whole slide images (WSI) of kidney biopsies, with a particular focus on distinguishing between normal and sclerotic glomeruli.
-
-## Overview
-
-The system uses a two-stage approach:
-1. **Detection Stage**: First identifies all glomeruli regions in a slide
-2. **Classification Stage**: Then classifies each detected glomerulus as normal, sclerotic, or partially sclerotic
-
-Key features of this implementation:
-- Advanced stain normalization using Vahadane method for robust color standardization
-- Comprehensive feature extraction (texture, color, morphology)
-- Two-stage detection and classification pipeline
-- Automated reference image selection for normalization
-- Analysis tools for visualizing results and feature importance
-
-## Requirements
-
-- Python >= 3.9
-- PyTorch >= 1.11.0
-- OpenSlide
-- scikit-learn
-- scikit-image
-- OpenCV
-- numpy, matplotlib, pandas
-- tqdm
-
-```bash
-pip install -r requirements.txt
-```
+A deep learning project for glomeruli segmentation in kidney tissue images using U-Net architecture.
 
 ## Project Structure
 
 ```
-src/
-├── config/         # Configuration files
-├── data/           # Data loading and preprocessing
-├── evaluation/     # Evaluation scripts
-├── inference/      # Inference scripts including two-stage pipeline
-├── models/         # Model definitions (detection and classification)
-└── utils/          # Utility functions, including stain normalization
-scripts/            # Executable scripts for different pipeline stages
-experiments/        # Results and experiment logs
+glomeruli-training/
+├── src/
+│   ├── data/
+│   │   └── dataset.py         # Dataset loading and preprocessing
+│   ├── models/
+│   │   └── unet.py           # U-Net model implementation
+│   └── training/
+│       ├── losses.py         # Segmentation loss functions
+│       └── segmentation_trainer.py  # U-Net training loop
+├── scripts/
+│   ├── preprocess_slides.py   # Slide preprocessing script
+│   └── train_unet.py         # U-Net training script
+├── data_test/                # Test dataset
+│   ├── raw/                  # Raw slides and QuPath annotations
+│   └── processed/            # Processed patches and masks
+├── data/                     # Main dataset
+│   ├── raw/                  # Raw slides and QuPath annotations
+│   └── processed/            # Processed patches and masks
+├── tests/                    # Test files
+├── notebooks/                # Jupyter notebooks
+├── requirements.txt          # Python dependencies
+└── setup.py                 # Package setup file
 ```
 
-## Workflow
+## Setup
 
-The complete pipeline consists of these steps:
-
-1. **Reference Selection**: Select an optimal reference image for stain normalization
-2. **Stain Normalization**: Standardize the color appearance of all slides
-3. **Training Detection Model**: Train the Cascade Mask R-CNN for glomeruli detection
-4. **Training Classification Model**: Train the specialized classifier for the second stage
-5. **Inference**: Run the two-stage pipeline on new slides
-6. **Analysis**: Analyze and visualize the results
-
-## Step-by-Step Guide
-
-### 1. Reference Image Selection
-
-First, select an optimal reference image for stain normalization:
-
+1. Create a virtual environment:
 ```bash
-python scripts/select_reference_image.py \
-    --images-dir data/training_images \
-    --output-dir experiments/reference_selection \
-    --n-clusters 3 \
-    --sample-size 100
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
 
-This will:
-- Analyze staining characteristics of images in the specified directory
-- Cluster them based on color features
-- Select the most representative image as reference
-- Save the reference image to `experiments/reference_selection/reference_image.png`
-
-### 2. Compare Stain Normalization Methods (Optional)
-
-To visually compare different normalization methods:
-
+2. Install dependencies:
 ```bash
-python scripts/compare_normalizers.py \
-    --image-path path/to/test_image.png \
-    --reference-path experiments/reference_selection/reference_image.png \
-    --output-dir experiments/normalization_comparison
+pip install -r requirements.txt
 ```
 
-This will generate a side-by-side comparison of original, Macenko, Reinhard, and Vahadane normalization methods.
+## Data Preparation
 
-### 3. Prepare Dataset
+The project expects data in the following format:
+- Whole slide images (.svs format)
+- QuPath annotations in GeoJSON format
 
-Process whole slide images into tiles and apply stain normalization:
+### Preprocessing Parameters
 
+The preprocessing script uses the following optimized parameters:
+- Patch size: 512x512 pixels (standard for glomeruli segmentation)
+- Magnification level: 0 (highest resolution)
+- Minimum tissue fraction: 0.1
+- Minimum glomeruli fraction: 0.05
+- Maximum glomeruli fraction: 0.9
+
+To preprocess your slides:
 ```bash
-python scripts/prepare_dataset.py \
-    --input-dir data/slides \
-    --annotations-dir data/annotations \
-    --output-dir data/processed \
-    --reference-image experiments/reference_selection/reference_image.png \
-    --normalization-method vahadane
-```
-
-This will:
-- Extract tiles from whole slide images
-- Apply Vahadane stain normalization
-- Split data into train/val/test sets
-- Save processed tiles and annotations
-
-### 4. Train Stage 1: Detection Model
-
-Train the Cascade Mask R-CNN for glomeruli detection:
-
-```bash
-python scripts/train_detector.py \
-    --data-config src/config/training_config.py \
-    --output-dir experiments/detection_model
-```
-
-### 5. Train Stage 2: Classification Model
-
-Train the specialized classifier for distinguishing between normal and sclerotic glomeruli:
-
-```bash
-python scripts/train_classifier.py \
-    --train-dir data/processed/train \
-    --val-dir data/processed/val \
-    --output-dir experiments/classifier \
-    --epochs 50 \
-    --batch-size 16 \
-    --class-names Normal Sclerotic Partially_sclerotic Uncertain
-```
-
-### 6. Run Inference on New Slides
-
-Process new slides using the full two-stage pipeline:
-
-```bash
-python scripts/process_svs.py \
-    --model-path experiments/detection_model/best_model.pth \
-    --classifier-path experiments/classifier/best_model.pth \
-    --input-dir data/test_slides \
-    --output-dir experiments/results \
-    --two-stage \
-    --normalization-method vahadane \
-    --reference-image experiments/reference_selection/reference_image.png \
+python scripts/preprocess_slides.py \
+    --slides_dir data/raw/slides \
+    --annotations_dir data/raw/annotations/QuPath \
+    --output_dir data/processed \
+    --patch_size 512 \
+    --level 0 \
+    --min_glomeruli_fraction 0.05 \
+    --max_glomeruli_fraction 0.9 \
     --visualize
 ```
 
 This will:
-- Process each slide in the input directory
-- Apply stain normalization
-- Detect all glomeruli using the first stage model
-- Classify each detected glomerulus using the second stage model
-- Generate visualizations and JSON results
+- Extract 512x512 patches centered on glomeruli
+- Create corresponding segmentation masks
+- Generate visualizations for quality control
+- Automatically split data into train/validation/test sets (70%/15%/15%)
+- Save all processed data in a format suitable for training
 
-### 7. Analyze Results
+### Output Structure
 
-Extract and analyze features from the detected and classified glomeruli:
+The processed data directory will contain:
+- `patches/`: Extracted image patches
+- `masks/`: Corresponding segmentation masks
+- `vis/`: Visualizations of patches and masks (if --visualize is used)
+- `splits.json`: Train/val/test split information
 
+## Training
+
+To train the U-Net model:
 ```bash
-python scripts/analyze_glomeruli.py \
-    --results-dir experiments/results \
-    --output-dir experiments/analysis \
-    --class-names Normal Sclerotic Partially_sclerotic Uncertain
+python scripts/train_unet.py --data_dir data/processed --output_dir experiments
 ```
 
-This will:
-- Extract features from all detected glomeruli
-- Generate t-SNE visualization showing class separation
-- Identify the most important features for classification
-- Generate confusion matrix and classification report
+## Model Architecture
 
-## Key Components
+The project uses a U-Net architecture with the following features:
+- Input: RGB images (3 channels, 512x512 pixels)
+- Output: Multi-class segmentation masks
+- Encoder path: 4 downsampling blocks
+- Decoder path: 4 upsampling blocks with skip connections
+- Final output: Number of classes (background + 4 glomeruli types)
 
-### Two-Stage Pipeline
+## Classes
 
-The pipeline is implemented in `src/inference/two_stage_pipeline.py` and consists of:
+The model segments the following classes:
+1. Background (label: 0)
+2. Normal glomeruli (label: 1)
+3. Sclerotic glomeruli (label: 2)
+4. Partially sclerotic glomeruli (label: 3)
+5. Uncertain cases (label: 4)
 
-1. **Stage 1 (Detection)**: Using Cascade Mask R-CNN to detect all glomeruli
-2. **Stage 2 (Classification)**: Using a specialized classifier with attention mechanism to distinguish between glomerulus types
+## Contributing
 
-### Stain Normalization
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
 
-Implemented in `src/utils/stain_normalization.py` with three methods:
-- **Vahadane**: Using sparse non-negative matrix factorization (recommended)
-- **Macenko**: Using singular value decomposition
-- **Reinhard**: Using color statistics matching
+## License
 
-### Feature Extraction
-
-Implemented in `src/utils/feature_extraction.py` with three main feature types:
-- **Texture Features**: Gabor filters, Local Binary Patterns, GLCM
-- **Color Features**: RGB, HSV, LAB statistics and histograms
-- **Morphological Features**: Shape descriptors, moments, solidity, circularity
-
-### Classification Model
-
-Implemented in `src/models/glomeruli_classifier.py` with:
-- CNN backbone with attention mechanism
-- Multi-feature fusion layer
-- Support for both image features and handcrafted features
-
-## Troubleshooting
-
-- **Memory Issues**: For large slides, try reducing `--tile-size` or increasing `--level`
-- **Stain Normalization Errors**: Ensure reference image contains tissue and is representative of staining pattern
-- **Classification Performance**: Try adjusting `--confidence-threshold` to balance precision and recall
-
-## References
-
-1. Vahadane, A., et al. (2016). Structure-Preserving Color Normalization and Sparse Stain Separation for Histological Images. IEEE TMI, 35(8), 1962-1971.
-2. Cai, Z., & Vasconcelos, N. (2018). Cascade R-CNN: Delving Into High Quality Object Detection. CVPR.
+This project is licensed under the MIT License - see the LICENSE file for details.
