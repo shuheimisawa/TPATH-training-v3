@@ -181,31 +181,31 @@ class CascadeMaskRCNN(nn.Module):
         
         # Build backbone
         self.backbone = ResNetBackbone(
-            name=config.backbone.name,
-            pretrained=config.backbone.pretrained,
-            freeze_stages=config.backbone.freeze_stages,
-            norm_eval=config.backbone.norm_eval,
-            out_indices=config.backbone.out_indices
+            name=config.detection.backbone.name,
+            pretrained=config.detection.backbone.pretrained,
+            freeze_stages=config.detection.backbone.freeze_stages,
+            norm_eval=config.detection.backbone.norm_eval,
+            out_indices=config.detection.backbone.out_indices
         )
         
         # Build feature pyramid network
-        if getattr(config, 'use_bifpn', False):
+        if getattr(config.detection, 'use_bifpn', False):
             # Use BiFPN for enhanced feature fusion
             self.fpn = BiFPN(
-                in_channels=config.fpn.in_channels,
-                out_channels=config.fpn.out_channels,
-                num_blocks=getattr(config.fpn, 'num_blocks', 3),
-                attention_type=getattr(config.fpn, 'attention_type', 'none'),
-                extra_convs_on_inputs=config.fpn.extra_convs_on_inputs
+                in_channels=config.detection.fpn.in_channels,
+                out_channels=config.detection.fpn.out_channels,
+                num_blocks=getattr(config.detection.fpn, 'num_blocks', 3),
+                attention_type=getattr(config.detection.fpn, 'attention_type', 'none'),
+                extra_convs_on_inputs=config.detection.fpn.extra_convs_on_inputs
             )
         else:
             # Use standard FPN
             self.fpn = FPN(
-                in_channels=config.fpn.in_channels,
-                out_channels=config.fpn.out_channels,
-                num_outs=config.fpn.num_outs,
-                add_extra_convs=config.fpn.add_extra_convs,
-                extra_convs_on_inputs=config.fpn.extra_convs_on_inputs
+                in_channels=config.detection.fpn.in_channels,
+                out_channels=config.detection.fpn.out_channels,
+                num_outs=config.detection.fpn.num_outs,
+                add_extra_convs=config.detection.fpn.add_extra_convs,
+                extra_convs_on_inputs=config.detection.fpn.extra_convs_on_inputs
             )
         
         # Anchor generator
@@ -215,33 +215,33 @@ class CascadeMaskRCNN(nn.Module):
         
         # RPN head
         self.rpn_head = RPNHead(
-            in_channels=config.fpn.out_channels,
+            in_channels=config.detection.fpn.out_channels,
             num_anchors=self.anchor_generator.num_anchors_per_location()[0]
         )
         
         # RoI feature extractor
         self.box_roi_pool = MultiScaleRoIAlign(
             featmap_names=['0', '1', '2', '3'],
-            output_size=config.roi.roi_size,
-            sampling_ratio=config.roi.roi_sample_num
+            output_size=config.detection.roi.roi_size,
+            sampling_ratio=config.detection.roi.roi_sample_num
         )
         
         # Initialize the cascade stages
-        self.num_cascade_stages = config.cascade.num_stages
+        self.num_cascade_stages = config.detection.cascade.num_stages
         self.cascade_stages = nn.ModuleList()
         
         for stage in range(self.num_cascade_stages):
             # Box head for this stage
             box_head = CascadeBoxHead(
-                in_channels=config.fpn.out_channels,
+                in_channels=config.detection.fpn.out_channels,
                 representation_size=1024,
-                roi_size=config.roi.roi_size
+                roi_size=config.detection.roi.roi_size
             )
             
             # Box predictor for this stage
             box_predictor = CascadeBoxPredictor(
                 in_channels=1024,
-                num_classes=config.roi.classes
+                num_classes=config.detection.roi.classes
             )
             
             # Add stage
@@ -253,20 +253,20 @@ class CascadeMaskRCNN(nn.Module):
         # Mask head
         self.mask_roi_pool = MultiScaleRoIAlign(
             featmap_names=['0', '1', '2', '3'],
-            output_size=config.mask.roi_size,
+            output_size=config.detection.mask.roi_size,
             sampling_ratio=2
         )
         
         # Add self-attention to mask head if enabled
-        use_attention = getattr(config, 'use_attention', False)
-        attention_type = getattr(config, 'attention_type', 'self')
+        use_attention = getattr(config.detection, 'use_attention', False)
+        attention_type = getattr(config.detection, 'attention_type', 'self')
         
         self.mask_head = MaskRCNNHeadWithAttention(
-            in_channels=config.fpn.out_channels,
+            in_channels=config.detection.fpn.out_channels,
             layers=(256, 256, 256, 256),
             dilation=1,
-            roi_size=config.mask.roi_size,
-            num_classes=config.num_classes,
+            roi_size=config.detection.mask.roi_size,
+            num_classes=config.detection.num_classes,
             use_attention=use_attention,
             attention_type=attention_type
         )
@@ -285,10 +285,10 @@ class CascadeMaskRCNN(nn.Module):
         )
         
         # Loss weights for each cascade stage
-        self.cascade_loss_weights = config.cascade.stage_loss_weights
+        self.cascade_loss_weights = config.detection.cascade.stage_loss_weights
         
         # IoU thresholds for positive samples in each cascade stage
-        self.cascade_iou_thresholds = config.cascade.iou_thresholds
+        self.cascade_iou_thresholds = config.detection.cascade.iou_thresholds
         
         # Initialize weights
         self._init_weights()
@@ -361,7 +361,7 @@ class CascadeMaskRCNN(nn.Module):
                     'boxes': torch.zeros((0, 4), device=images.tensors.device),
                     'labels': torch.zeros((0,), dtype=torch.int64, device=images.tensors.device),
                     'scores': torch.zeros((0,), device=images.tensors.device),
-                    'masks': torch.zeros((0, self.config.num_classes, *self.config.mask.roi_size), device=images.tensors.device)
+                    'masks': torch.zeros((0, self.config.detection.num_classes, *self.config.detection.mask.roi_size), device=images.tensors.device)
                 } for _ in range(len(images))]
                 return empty_detections
         
@@ -437,7 +437,7 @@ class CascadeMaskRCNN(nn.Module):
                 mask_logits = self.mask_head(mask_features)
                 masks = F.sigmoid(mask_logits)
             else:
-                masks = torch.zeros((0, self.config.num_classes, *self.config.mask.roi_size), device=images.tensors.device)
+                masks = torch.zeros((0, self.config.detection.num_classes, *self.config.detection.mask.roi_size), device=images.tensors.device)
             
             # Post-process detections
             detections = [{
@@ -499,7 +499,7 @@ class CascadeMaskRCNN(nn.Module):
         
         if sampled_pos_inds_subset.sum() > 0:
             # Get the box regression for the correct classes
-            box_regression = box_regression.view(-1, self.config.roi.classes, 4)
+            box_regression = box_regression.view(-1, self.config.detection.roi.classes, 4)
             box_regression = box_regression[torch.arange(len(box_regression)), labels_pos - 1]
             
             box_regression_loss = F.smooth_l1_loss(
@@ -530,12 +530,12 @@ class CascadeMaskRCNN(nn.Module):
             box_regression_per_image = box_regression[start_idx:start_idx + num_props]
             
             # Get the regression deltas for the predicted classes
-            if self.config.roi.reg_class_agnostic:
+            if self.config.detection.roi.reg_class_agnostic:
                 # Class-agnostic regression
                 box_regression_per_image = box_regression_per_image.view(-1, 4)
             else:
                 # Class-specific regression
-                box_regression_per_image = box_regression_per_image.view(-1, self.config.roi.classes, 4)
+                box_regression_per_image = box_regression_per_image.view(-1, self.config.detection.roi.classes, 4)
                 box_regression_per_image = box_regression_per_image[torch.arange(len(box_regression_per_image)), labels[start_idx:start_idx + num_props] - 1]
             
             # Apply regression to proposals

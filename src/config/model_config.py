@@ -38,24 +38,79 @@ class FeatureExtractionConfig:
 
 
 @dataclass
-class DetectionConfig:
-    """Configuration for glomeruli detection (stage 1)."""
+class BackboneConfig:
+    """Configuration for the backbone network."""
     
-    # Cascade Mask R-CNN parameters
+    name: str = "resnet50"
+    pretrained: bool = True
+    out_channels: List[int] = field(default_factory=lambda: [256, 512, 1024, 2048])
+    freeze_stages: int = 1  # Number of stages to freeze during training
+    norm_eval: bool = True  # Whether to set BN layers to eval mode
+    out_indices: Tuple[int, ...] = (0, 1, 2, 3)  # Output stages
+    
+@dataclass
+class FPNConfig:
+    """Configuration for Feature Pyramid Network."""
+    
+    in_channels: List[int] = field(default_factory=lambda: [256, 512, 1024, 2048])
+    out_channels: int = 256
+    num_outs: int = 5
+    add_extra_convs: bool = True
+    extra_convs_on_inputs: bool = True
+    num_blocks: int = 3
+    attention_type: str = "none"
+
+@dataclass
+class CascadeConfig:
+    """Configuration for cascade stages."""
+    
     num_stages: int = 3
-    backbone: str = "resnet50"
-    fpn: bool = True
-    anchor_sizes: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512])
-    aspect_ratios: List[float] = field(default_factory=lambda: [0.5, 1.0, 2.0])
+    stage_loss_weights: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.25])
+    iou_thresholds: List[float] = field(default_factory=lambda: [0.5, 0.6, 0.7])
+
+@dataclass
+class MaskConfig:
+    """Configuration for mask head."""
     
-    # Detection thresholds
-    score_threshold: float = 0.7
+    roi_size: Tuple[int, int] = (14, 14)
+    num_classes: int = 5  # Including background
+    use_attention: bool = False  # Disable attention since it's not in the checkpoint
+    attention_type: str = "self"
+
+@dataclass
+class ROIConfig:
+    """Configuration for Region of Interest (ROI) head."""
+    
+    box_head_dim: int = 1024
+    num_classes: int = 5  # Including background
+    box_score_thresh: float = 0.05
+    box_nms_thresh: float = 0.5
+    box_detections_per_img: int = 100
+    box_fg_iou_thresh: float = 0.5
+    box_bg_iou_thresh: float = 0.5
+    box_batch_size_per_image: int = 512
+    box_positive_fraction: float = 0.25
+    bbox_reg_weights: List[float] = field(default_factory=lambda: [10.0, 10.0, 5.0, 5.0])
+    roi_size: Tuple[int, int] = (7, 7)
+    roi_sample_num: int = 2
+    classes: int = 5  # Including background
+    reg_class_agnostic: bool = False
+
+@dataclass
+class DetectionConfig:
+    """Configuration for glomeruli detection."""
+    
+    backbone: BackboneConfig = field(default_factory=BackboneConfig)
+    fpn: FPNConfig = field(default_factory=FPNConfig)
+    num_classes: int = 5  # Including background
+    score_threshold: float = 0.5
     nms_threshold: float = 0.5
-    
-    # Training parameters
-    roi_batch_size: int = 128
-    positive_fraction: float = 0.25
-    bbox_reg_weights: List[float] = field(default_factory=lambda: [0.1, 0.1, 0.2, 0.2])
+    roi: ROIConfig = field(default_factory=ROIConfig)
+    cascade: CascadeConfig = field(default_factory=CascadeConfig)
+    mask: MaskConfig = field(default_factory=MaskConfig)
+    use_bifpn: bool = False
+    use_attention: bool = False  # Disable attention since it's not in the checkpoint
+    attention_type: str = "self"
 
 
 @dataclass

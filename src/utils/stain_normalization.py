@@ -76,12 +76,12 @@ class VahadaneNormalizer:
         # Sparse NMF to extract stain matrix
         # Using scikit-learn's NMF with L1 regularization for sparsity
         model = NMF(n_components=self.n_stains, 
-                    init='random', 
-                    random_state=0,
-                    solver='cd',
-                    alpha=self.lambda1,
-                    l1_ratio=1,  # L1 regularization
-                    max_iter=1000)
+                   init='random', 
+                   random_state=0,
+                   solver='cd',
+                   max_iter=1000,
+                   alpha=self.lambda1,  # L1/L2 regularization parameter
+                   l1_ratio=1.0)  # Use L1 regularization only
         
         try:
             W = model.fit_transform(od)  # Concentrations
@@ -114,12 +114,12 @@ class VahadaneNormalizer:
         
         # Create sparse NMF model with fixed stain matrix
         model = NMF(n_components=self.n_stains,
-                    init='custom',
-                    random_state=0,
-                    solver='cd',
-                    alpha=self.lambda2,
-                    l1_ratio=1,  # L1 regularization
-                    max_iter=1000)
+                   init='custom',
+                   random_state=0,
+                   solver='cd',
+                   max_iter=1000,
+                   alpha=self.lambda2,  # L1/L2 regularization parameter
+                   l1_ratio=1.0)  # Use L1 regularization only
         
         # Set components (H) and only solve for W
         model.components_ = stain_matrix.T
