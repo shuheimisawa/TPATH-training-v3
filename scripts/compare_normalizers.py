@@ -1,4 +1,4 @@
-# New file: scripts/compare_normalizers.py
+# scripts/compare_normalizers.py
 
 import os
 import numpy as np
@@ -8,7 +8,7 @@ from glob import glob
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from src.utils.stain_normalization import MacenkoNormalizer, ReinmetNormalizer, VahadaneNormalizer
+from src.utils.stain_normalization import VahadaneNormalizer
 from src.utils.io import load_image, save_image
 from src.utils.logger import get_logger
 
@@ -26,8 +26,6 @@ def compare_normalizers(image_path, reference_path, output_dir):
     normalizers = {
         'Original': None,
         'Reference': None,
-        'Macenko': MacenkoNormalizer(),
-        'Reinhard': ReinmetNormalizer(),
         'Vahadane': VahadaneNormalizer()
     }
     
@@ -47,7 +45,7 @@ def compare_normalizers(image_path, reference_path, output_dir):
             results[name] = normalizer.transform(image)
     
     # Create visualization
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     axes = axes.flatten()
     
     for i, (name, result) in enumerate(results.items()):
