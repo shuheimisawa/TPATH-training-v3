@@ -45,56 +45,75 @@ def parse_args():
 
 
 def create_model(config, device, checkpoint_path):
-    """Create model and load checkpoint."""
+    """Create model and load checkpoint with ROI size adjustment."""
     try:
-        # Create model
+        # Detect if we need to adjust ROI size based on checkpoint
+        adjust_roi_size = False
+        original_roi_size = config.roi.roi_size
+        
+        # Load checkpoint first to check model parameters
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            # Try to determine ROI size from checkpoint
+            if 'model_state_dict' in checkpoint:
+                # Check box head FC layer shape
+                for key, value in checkpoint['model_state_dict'].items():
+                    if 'box_head.fc6.weight' in key:
+                        # Calculate ROI size from weight shape
+                        # fc6.weight has shape [out_features, in_channels * roi_h * roi_w]
+                        # where out_features is typically 1024
+                        in_features = value.shape[1]
+                        in_channels = config.fpn.out_channels
+                        # Calculate roi_size assuming square ROIs
+                        roi_dim = int(np.sqrt(in_features / in_channels))
+                        
+                        # Update config to match checkpoint
+                        if roi_dim * roi_dim * in_channels == in_features:
+                            print(f"Adjusting ROI size from {config.roi.roi_size} to ({roi_dim}, {roi_dim})")
+                            config.roi.roi_size = (roi_dim, roi_dim)
+                            adjust_roi_size = True
+                        break
+        
+        # Create model with adjusted config
         model = CascadeMaskRCNN(config)
         model.to(device)
         
         # Load checkpoint
         if os.path.exists(checkpoint_path):
-            # Convert device to string for map_location to avoid DirectML issues
-            if hasattr(device, 'type'):
-                map_device = device.type
-            else:
-                map_device = str(device)
-                
-            print(f"Loading checkpoint with map_location={map_device}")
-            
             try:
-                # Use 'cpu' first to avoid any device-specific issues, then move to target device
-                checkpoint = torch.load(checkpoint_path, map_location='cpu')
-                print("Loaded checkpoint to CPU first")
+                # Use 'cpu' first to avoid any device-specific issues
+                print("Loading checkpoint to model")
+                
+                if 'model_state_dict' in checkpoint:
+                    # Handle potential key mismatches
+                    try:
+                        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+                        print("Checkpoint loaded with strict matching")
+                    except Exception as e:
+                        print(f"Strict loading failed: {e}")
+                        print("Trying non-strict loading...")
+                        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                        print("Checkpoint loaded with non-strict matching")
+                else:
+                    # Try loading as direct state dict
+                    try:
+                        model.load_state_dict(checkpoint, strict=True)
+                        print("State dictionary loaded with strict matching")
+                    except Exception as e:
+                        print(f"Strict loading failed: {e}")
+                        print("Trying non-strict loading...")
+                        model.load_state_dict(checkpoint, strict=False)
+                        print("State dictionary loaded with non-strict matching")
             except Exception as e:
-                print(f"Error loading checkpoint to CPU: {e}")
-                # Direct device loading as fallback
-                checkpoint = torch.load(checkpoint_path, map_location=str(device))
-            
-            if 'model_state_dict' in checkpoint:
-                # Handle potential key mismatches
-                try:
-                    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
-                    print("Checkpoint loaded with strict matching")
-                except Exception as e:
-                    print(f"Strict loading failed: {e}")
-                    print("Trying non-strict loading...")
-                    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-                    print("Checkpoint loaded with non-strict matching")
-            else:
-                # Try loading as direct state dict
-                try:
-                    model.load_state_dict(checkpoint, strict=True)
-                    print("State dictionary loaded with strict matching")
-                except Exception as e:
-                    print(f"Strict loading failed: {e}")
-                    print("Trying non-strict loading...")
-                    model.load_state_dict(checkpoint, strict=False)
-                    print("State dictionary loaded with non-strict matching")
-                    
-            # Make sure model is on the correct device after loading
-            model = model.to(device)
-        else:
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+                print(f"Error loading checkpoint: {e}")
+                # If we adjusted the ROI size but failed to load, revert to original
+                if adjust_roi_size:
+                    print(f"Reverting ROI size to original: {original_roi_size}")
+                    config.roi.roi_size = original_roi_size
+                    model = CascadeMaskRCNN(config)
+                    model.to(device)
+                raise
         
         return model
     except Exception as e:

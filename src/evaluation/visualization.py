@@ -18,22 +18,11 @@ def visualize_prediction(
     figure_size: Tuple[int, int] = (12, 12),
     title: Optional[str] = None
 ) -> Image.Image:
-    """Visualize model prediction on an image.
+    """Visualize model prediction on an image."""
+    # Use Agg backend explicitly
+    import matplotlib
+    matplotlib.use('Agg')  # Use the Agg backend
     
-    Args:
-        image: Input image as numpy array
-        prediction: Dictionary with model prediction (boxes, labels, scores, masks)
-        class_names: List of class names
-        save_path: Path to save the visualization
-        show_masks: Whether to show masks
-        show_boxes: Whether to show bounding boxes
-        show_scores: Whether to show confidence scores
-        figure_size: Size of the figure
-        title: Optional title for the figure
-        
-    Returns:
-        Visualization as PIL Image
-    """
     # Make a copy of the image to avoid modifying the original
     img = image.copy()
     
@@ -62,6 +51,8 @@ def visualize_prediction(
     # Check if we have valid predictions
     if boxes is None or len(boxes) == 0:
         # No predictions, just show the image
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1, dpi=100)
         plt.close(fig)
         return Image.fromarray(img)
     
@@ -136,19 +127,19 @@ def visualize_prediction(
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1, dpi=100)
     
     # Convert figure to PIL Image
-    # Tight layout to remove white margins
     plt.tight_layout()
-    fig.canvas.draw()
     
-    # Convert canvas to numpy array
-    img_np = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_np = img_np.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    # Save to a BytesIO object and then to PIL Image
+    from io import BytesIO
+    buf = BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    buf.seek(0)
     
     # Close figure to free memory
     plt.close(fig)
     
     # Return as PIL Image
-    return Image.fromarray(img_np)
+    return Image.open(buf)
 
 def visualize_batch_predictions(
     images: List[np.ndarray],
