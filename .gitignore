@@ -104,3 +104,14 @@ nosetests.xml
 coverage.xml
 *.cover
 .hypothesis/
+
+# Local development settings
+.env
+.env.local
+
+# Model checkpoints and data
+checkpoints/
+*.ckpt
+
+# OS-specific
+Thumbs.db
