@@ -1,3 +1,4 @@
+# src/utils/io.py
 import os
 import json
 import yaml
@@ -40,15 +41,19 @@ def load_image(image_path: str) -> np.ndarray:
         
         return image
     except Exception as e:
-        raise IOError(f"Failed to load image {image_path}: {e}")
+        print(f"Failed to load image {image_path}: {e}")
+        return None
 
 
-def save_image(image: np.ndarray, save_path: str) -> None:
+def save_image(image: np.ndarray, save_path: str) -> bool:
     """Save an image to path.
     
     Args:
         image: Image as numpy array
         save_path: Path to save the image
+        
+    Returns:
+        True if successful, False otherwise
     """
     # Create directory if it doesn't exist
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -63,8 +68,10 @@ def save_image(image: np.ndarray, save_path: str) -> None:
             image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
             # Save image
             cv2.imwrite(save_path, image_bgr)
+        return True
     except Exception as e:
-        raise IOError(f"Failed to save image {save_path}: {e}")
+        print(f"Failed to save image {save_path}: {e}")
+        return False
 
 
 def load_json(file_path: str) -> Dict:
@@ -85,17 +92,22 @@ def load_json(file_path: str) -> Dict:
         
         return data
     except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in {file_path}: {e}")
+        print(f"Invalid JSON in {file_path}: {e}")
+        return {}
     except Exception as e:
-        raise IOError(f"Failed to load JSON {file_path}: {e}")
+        print(f"Failed to load JSON {file_path}: {e}")
+        return {}
 
 
-def save_json(data: Dict, file_path: str) -> None:
+def save_json(data: Dict, file_path: str) -> bool:
     """Save data to a JSON file.
     
     Args:
         data: Data to save
         file_path: Path to save the file
+        
+    Returns:
+        True if successful, False otherwise
     """
     # Create directory if it doesn't exist
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -103,8 +115,10 @@ def save_json(data: Dict, file_path: str) -> None:
     try:
         with open(file_path, 'w') as f:
             json.dump(data, f, indent=2)
+        return True
     except Exception as e:
-        raise IOError(f"Failed to save JSON {file_path}: {e}")
+        print(f"Failed to save JSON {file_path}: {e}")
+        return False
 
 
 def load_yaml(file_path: str) -> Dict:
@@ -125,17 +139,22 @@ def load_yaml(file_path: str) -> Dict:
         
         return data
     except yaml.YAMLError as e:
-        raise ValueError(f"Invalid YAML in {file_path}: {e}")
+        print(f"Invalid YAML in {file_path}: {e}")
+        return {}
     except Exception as e:
-        raise IOError(f"Failed to load YAML {file_path}: {e}")
+        print(f"Failed to load YAML {file_path}: {e}")
+        return {}
 
 
-def save_yaml(data: Dict, file_path: str) -> None:
+def save_yaml(data: Dict, file_path: str) -> bool:
     """Save data to a YAML file.
     
     Args:
         data: Data to save
         file_path: Path to save the file
+        
+    Returns:
+        True if successful, False otherwise
     """
     # Create directory if it doesn't exist
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -143,5 +162,7 @@ def save_yaml(data: Dict, file_path: str) -> None:
     try:
         with open(file_path, 'w') as f:
             yaml.safe_dump(data, f, sort_keys=False)
+        return True
     except Exception as e:
-        raise IOError(f"Failed to save YAML {file_path}: {e}")
+        print(f"Failed to save YAML {file_path}: {e}")
+        return False

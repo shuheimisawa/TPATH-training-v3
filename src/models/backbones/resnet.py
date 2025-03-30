@@ -32,7 +32,24 @@ class ResNetBackbone(nn.Module):
         
         # Create ResNet model
         model_func = getattr(torchvision.models, name)
-        weights = torchvision.models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+        
+        # Get the correct weights class based on the model name
+        if pretrained:
+            if name == 'resnet18':
+                weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1
+            elif name == 'resnet34':
+                weights = torchvision.models.ResNet34_Weights.IMAGENET1K_V1
+            elif name == 'resnet50':
+                weights = torchvision.models.ResNet50_Weights.IMAGENET1K_V1
+            elif name == 'resnet101':
+                weights = torchvision.models.ResNet101_Weights.IMAGENET1K_V1
+            elif name == 'resnet152':
+                weights = torchvision.models.ResNet152_Weights.IMAGENET1K_V1
+            else:
+                raise ValueError(f"Unsupported ResNet variant: {name}")
+        else:
+            weights = None
+            
         resnet = model_func(weights=weights)
         
         # Remove fully connected layer and average pooling
@@ -136,5 +153,3 @@ class ResNetBackbone(nn.Module):
                     m.eval()
                     for param in m.parameters():
                         param.requires_grad = False
-
-

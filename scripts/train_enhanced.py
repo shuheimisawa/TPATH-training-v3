@@ -14,19 +14,16 @@ import datetime
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.config.model_config import ModelConfig
-from src.config.training_config import TrainingConfig
+from src.config.training_config import TrainingConfig, OptimizerConfig, LRSchedulerConfig
 from src.models.cascade_mask_rcnn import CascadeMaskRCNN
 from src.data.dataset import GlomeruliDataset
 from src.data.transforms import get_train_transforms, get_val_transforms
-from src.data.loader import create_dataloaders
+from src.data.loader import create_dataloaders, collate_fn
 from src.training.trainer import Trainer
 from src.training.callbacks import ModelCheckpoint, EarlyStopping
-from src.training.enhanced_loss import EnhancedMaskRCNNLoss
 from src.utils.logger import get_logger
 from src.utils.io import load_yaml, save_json
-from src.utils.directml_adapter import get_dml_device, is_available, empty_cache
-from src.models.components.enhanced_mask_head import MaskRCNNHeadWithBoundary
-from src.utils.stain_normalization import StainNormalizationTransform
+from src.utils.directml_adapter import get_dml_device, is_available, empty_cache, get_device_info
 
 
 def parse_args():
@@ -51,6 +48,12 @@ def parse_args():
                         help='Number of epochs (overrides config)')
     parser.add_argument('--batch-size', type=int, default=None,
                         help='Batch size (overrides config)')
+    parser.add_argument('--backbone', type=str, default=None,
+                        help='Backbone model to use (overrides config)')
+    parser.add_argument('--cpu', action='store_true',
+                        help='Force using CPU even if GPU is available')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug mode with fewer samples')
     
     return parser.parse_args()
 
@@ -67,18 +70,40 @@ def update_config_from_args(config, args):
         config.epochs = args.epochs
     if args.batch_size is not None:
         config.batch_size = args.batch_size
+    if args.debug:
+        config.debug = True
+        config.debug_samples = 10  # Use only 10 samples in debug mode
     
     # Update data paths if data directory is provided
     if args.data_dir:
-        config.data.train_path = os.path.join(args.data_dir, 'train')
-        config.data.val_path = os.path.join(args.data_dir, 'val')
-        config.data.test_path = os.path.join(args.data_dir, 'test')
+        # Convert relative path to absolute path
+        data_dir = os.path.abspath(args.data_dir)
+        config.data.train_path = os.path.join(data_dir, 'train')
+        config.data.val_path = os.path.join(data_dir, 'val')
+        config.data.test_path = os.path.join(data_dir, 'test')
         
+    return config
+
+
+def update_model_config_from_args(config, args):
+    """Update model config with command line arguments."""
+    if args.backbone:
+        # Validate backbone name
+        valid_backbones = ['resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']
+        if args.backbone not in valid_backbones:
+            print(f"Warning: Invalid backbone name '{args.backbone}'. Must be one of {valid_backbones}")
+            print(f"Using default backbone: {config.backbone.name}")
+        else:
+            config.backbone.name = args.backbone
+    
     return config
 
 
 def update_config_from_dict(config_obj, config_dict):
     """Update a config object with values from a dictionary."""
+    if config_dict is None:
+        return config_obj
+        
     for key, value in config_dict.items():
         if hasattr(config_obj, key):
             attr = getattr(config_obj, key)
@@ -91,178 +116,68 @@ def update_config_from_dict(config_obj, config_dict):
                     setattr(config_obj, key, value)
             else:
                 # Direct attribute update
-                setattr(config_obj, key, value)
+                try:
+                    # Handle type conversion for basic types
+                    if isinstance(attr, bool) and isinstance(value, str):
+                        value = value.lower() in ('true', 'yes', '1', 'y')
+                    elif isinstance(attr, int) and not isinstance(value, bool):
+                        value = int(value)
+                    elif isinstance(attr, float) and not isinstance(value, bool):
+                        value = float(value)
+                    
+                    setattr(config_obj, key, value)
+                except Exception as e:
+                    print(f"Warning: Error setting attribute '{key}' to '{value}': {e}")
+    
     return config_obj
 
 
 def create_model(config, device, logger, checkpoint_path=None):
     """Create model and initialize it."""
-    logger.info("Creating model")
+    logger.info(f"Creating model with backbone: {config.backbone.name}")
     
-    # Create model with enhanced mask head if using boundary-aware segmentation
-    model = CascadeMaskRCNN(config)
-    
-    # Replace default mask head with enhanced mask head if specified
-    if getattr(config, 'use_enhanced_mask_head', True):
-        logger.info("Using enhanced mask head with boundary awareness")
+    try:
+        # Create model
+        model = CascadeMaskRCNN(config)
         
-        # Save original mask head for reference
-        original_mask_head = model.mask_head
+        # Move model to device
+        model = model.to(device)
         
-        # Create enhanced mask head
-        enhanced_mask_head = MaskRCNNHeadWithBoundary(
-            in_channels=config.mask.in_channels,
-            roi_size=config.mask.roi_size,
-            num_classes=config.num_classes,
-            use_attention=config.use_attention,
-            attention_type=config.attention_type
-        )
-        
-        # Replace mask head
-        model.mask_head = enhanced_mask_head
-    
-    # Move model to device
-    model = model.to(device)
-    
-    # Load checkpoint if provided
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        try:
-            logger.info(f"Loading checkpoint from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            
-            if 'model_state_dict' in checkpoint:
-                # Handle potential key mismatches due to mask head replacement
-                state_dict = checkpoint['model_state_dict']
+        # Load checkpoint if provided
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            try:
+                logger.info(f"Loading checkpoint from {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, map_location=device)
                 
-                # Try to load with strict=False first
-                model.load_state_dict(state_dict, strict=False)
-                logger.info("Checkpoint loaded with non-strict matching")
-            else:
-                # Try loading as direct state dict
-                model.load_state_dict(checkpoint, strict=False)
-                logger.info("State dictionary loaded with non-strict matching")
-        except Exception as e:
-            logger.error(f"Error loading checkpoint: {e}")
-            logger.error(traceback.format_exc())
-    
-    return model
-
-
-def create_loss_function(config, device, logger):
-    """Create enhanced loss function."""
-    logger.info("Creating enhanced loss function")
-    
-    # Extract loss config
-    loss_config = getattr(config, 'loss', {})
-    
-    # Check if enhanced loss should be used
-    use_enhanced_loss = getattr(loss_config, 'use_enhanced_loss', True)
-    
-    if use_enhanced_loss:
-        # Create class weights tensor
-        class_weights = [1.0]  # Background weight
-        for cls_name in config.data.classes:
-            weight = getattr(config.data.class_weights, cls_name, 1.0)
-            class_weights.append(weight)
+                if 'model_state_dict' in checkpoint:
+                    # Handle potential key mismatches
+                    try:
+                        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+                        logger.info("Checkpoint loaded with strict matching")
+                    except Exception as e:
+                        logger.warning(f"Strict loading failed: {e}")
+                        logger.warning("Trying non-strict loading...")
+                        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                        logger.info("Checkpoint loaded with non-strict matching")
+                else:
+                    # Try loading as direct state dict
+                    try:
+                        model.load_state_dict(checkpoint, strict=True)
+                        logger.info("State dictionary loaded with strict matching")
+                    except Exception as e:
+                        logger.warning(f"Strict loading failed: {e}")
+                        logger.warning("Trying non-strict loading...")
+                        model.load_state_dict(checkpoint, strict=False)
+                        logger.info("State dictionary loaded with non-strict matching")
+            except Exception as e:
+                logger.error(f"Error loading checkpoint: {e}")
+                logger.error(traceback.format_exc())
         
-        class_weights_tensor = torch.tensor(class_weights).to(device)
-        
-        # Create enhanced loss function
-        loss_fn = EnhancedMaskRCNNLoss(
-            rpn_cls_weight=getattr(loss_config, 'rpn_cls_loss_weight', 1.0),
-            rpn_bbox_weight=getattr(loss_config, 'rpn_bbox_loss_weight', 1.0),
-            rcnn_cls_weight=getattr(loss_config, 'rcnn_cls_weight', 1.2),
-            rcnn_bbox_weight=getattr(loss_config, 'rcnn_bbox_weight', 1.0),
-            mask_weight=getattr(loss_config, 'mask_loss_weight', 1.5),
-            focal_tversky_weight=getattr(loss_config, 'focal_tversky_weight', 0.7),
-            boundary_weight=getattr(loss_config, 'boundary_weight', 0.3),
-            class_weights=class_weights_tensor
-        )
-        
-        logger.info("Using enhanced loss function with focal Tversky and boundary components")
-    else:
-        # Fall back to standard loss
-        from src.training.loss import MaskRCNNLoss
-        
-        # Create class weights tensor
-        class_weights = [1.0]  # Background weight
-        for cls_name in config.data.classes:
-            weight = getattr(config.data.class_weights, cls_name, 1.0)
-            class_weights.append(weight)
-        
-        class_weights_tensor = torch.tensor(class_weights).to(device)
-        
-        # Create standard loss function
-        loss_fn = MaskRCNNLoss(
-            rpn_cls_weight=getattr(loss_config, 'rpn_cls_loss_weight', 1.0),
-            rpn_bbox_weight=getattr(loss_config, 'rpn_bbox_loss_weight', 1.0),
-            rcnn_cls_weight=getattr(loss_config, 'rcnn_cls_weight', 1.0),
-            rcnn_bbox_weight=getattr(loss_config, 'rcnn_bbox_weight', 1.0),
-            mask_weight=getattr(loss_config, 'mask_loss_weight', 1.0),
-            dice_weight=getattr(loss_config, 'dice_weight', 0.5),
-            class_weights=class_weights_tensor
-        )
-        
-        logger.info("Using standard loss function")
-    
-    return loss_fn
-
-
-def create_transforms(config, logger):
-    """Create data transforms with stain normalization."""
-    logger.info("Creating data transforms")
-    
-    # Check if stain normalization should be used
-    use_stain_norm = getattr(config.data, 'use_stain_normalization', False)
-    
-    if use_stain_norm:
-        # Extract stain normalization config
-        stain_norm_config = getattr(config.data, 'stain_normalization', {})
-        
-        # Create stain normalization transform
-        method = getattr(stain_norm_config, 'method', 'macenko')
-        target_image_path = getattr(stain_norm_config, 'target_image_path', None)
-        params_path = getattr(stain_norm_config, 'params_path', None)
-        
-        logger.info(f"Using {method} stain normalization")
-        
-        # Handle target image path
-        if target_image_path and not os.path.exists(target_image_path):
-            logger.warning(f"Target image not found: {target_image_path}")
-            target_image_path = None
-        
-        # Create stain normalization transform
-        stain_norm_transform = StainNormalizationTransform(
-            method=method,
-            target_image_path=target_image_path,
-            params_path=params_path
-        )
-        
-        # Create normalization params directory if needed
-        if target_image_path and params_path is None:
-            norm_dir = os.path.join(config.log_dir, 'stain_normalization')
-            os.makedirs(norm_dir, exist_ok=True)
-            
-            # Save normalization parameters for future use
-            params_path = os.path.join(norm_dir, f"{method}_params.npz")
-            stain_norm_transform.normalizer.save(params_path)
-            logger.info(f"Saved stain normalization parameters to {params_path}")
-    else:
-        stain_norm_transform = None
-        logger.info("Stain normalization disabled")
-    
-    # Get standard transforms
-    train_transform = get_train_transforms(
-        config=vars(config.data),
-        custom_transforms=[stain_norm_transform] if stain_norm_transform else None
-    )
-    
-    val_transform = get_val_transforms(
-        config=vars(config.data),
-        custom_transforms=[stain_norm_transform] if stain_norm_transform else None
-    )
-    
-    return train_transform, val_transform
+        return model
+    except Exception as e:
+        logger.error(f"Error creating model: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 
 def main():
@@ -291,8 +206,9 @@ def main():
     if 'training' in config_dict:
         update_config_from_dict(training_config, config_dict['training'])
     
-    # Update config from command line arguments
+    # Update configs from command line arguments
     training_config = update_config_from_args(training_config, args)
+    model_config = update_model_config_from_args(model_config, args)
     
     # Create directories
     os.makedirs(training_config.checkpoint_dir, exist_ok=True)
@@ -314,10 +230,11 @@ def main():
         logger.info("OpenCV not available")
     
     # Set random seed
-    torch.manual_seed(training_config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(training_config.seed)
-    logger.info(f"Using random seed: {training_config.seed}")
+    if training_config.seed is not None:
+        torch.manual_seed(training_config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(training_config.seed)
+        logger.info(f"Using random seed: {training_config.seed}")
     
     # Log config information
     logger.info(f"Model configuration: {model_config}")
@@ -325,70 +242,55 @@ def main():
     
     try:
         # Set device
-        if is_available():
+        if args.cpu:
+            device = torch.device("cpu")
+            logger.info("Forcing CPU usage as requested")
+        elif is_available() and not args.cpu:
             device = get_dml_device(args.gpu)
-            logger.info("Using DirectML device")
-        elif torch.cuda.is_available():
+            logger.info(f"Using DirectML device: {get_device_info()}")
+        elif torch.cuda.is_available() and not args.cpu:
             device = torch.device(f"cuda:{args.gpu}")
             logger.info(f"Using CUDA device {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
         else:
             device = torch.device("cpu")
             logger.info("Using CPU device")
         
-        # Create transforms
-        train_transform, val_transform = create_transforms(training_config, logger)
-        
         # Create model
         model = create_model(model_config, device, logger, args.resume)
         
-        # Create loss function
-        loss_fn = create_loss_function(training_config, device, logger)
-        
         # Create data loaders
         logger.info("Creating data loaders")
+        
+        # Format config for data loaders
         dataloader_config = {
-            'batch_size': training_config.batch_size,
-            'num_workers': training_config.workers,
-            'pin_memory': getattr(training_config, 'pin_memory', True)
+            'data': {
+                'train_dir': training_config.data.train_path,
+                'val_dir': training_config.data.val_path,
+                'test_dir': training_config.data.test_path
+            },
+            'transforms': {
+                'train': {
+                    'mean': training_config.data.mean,
+                    'std': training_config.data.std,
+                    'use_augmentation': training_config.data.use_augmentation,
+                    'augmentations': training_config.data.augmentations
+                },
+                'val': {
+                    'mean': training_config.data.mean,
+                    'std': training_config.data.std
+                }
+            },
+            'training': {
+                'batch_size': training_config.batch_size,
+                'num_workers': training_config.workers
+            }
         }
         
-        train_dataset = GlomeruliDataset(
-            data_dir=training_config.data.train_path,
-            mode='train',
-            transform=train_transform
-        )
-        
-        val_dataset = GlomeruliDataset(
-            data_dir=training_config.data.val_path,
-            mode='val',
-            transform=val_transform
-        )
-        
-        logger.info(f"Created training dataset with {len(train_dataset)} samples")
-        logger.info(f"Created validation dataset with {len(val_dataset)} samples")
-        
         # Create data loaders
-        from src.data.loader import collate_fn
+        dataloaders = create_dataloaders(dataloader_config, distributed=training_config.distributed)
         
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=dataloader_config['batch_size'],
-            shuffle=True,
-            num_workers=dataloader_config['num_workers'],
-            collate_fn=collate_fn,
-            pin_memory=dataloader_config['pin_memory'],
-            drop_last=False
-        )
-        
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=dataloader_config['batch_size'],
-            shuffle=False,
-            num_workers=dataloader_config['num_workers'],
-            collate_fn=collate_fn,
-            pin_memory=dataloader_config['pin_memory'],
-            drop_last=False
-        )
+        train_loader = dataloaders['train']
+        val_loader = dataloaders['val']
         
         # Create callbacks
         callbacks = []
@@ -414,135 +316,19 @@ def main():
         )
         callbacks.append(early_stopping)
         
-        # Create optimizer
-        from src.training.optimization import create_optimizer, create_lr_scheduler
-        
-        optimizer = create_optimizer(
-            model.parameters(),
-            vars(training_config.optimizer)
-        )
-        
-        # Create LR scheduler
-        lr_scheduler = create_lr_scheduler(
-            optimizer,
-            vars(training_config.lr_scheduler)
-        )
-        
-        # Overwrite Trainer's loss function with our enhanced one
-        class EnhancedTrainer(Trainer):
-            def __init__(self, *args, **kwargs):
-                custom_loss_fn = kwargs.pop('loss_fn', None)
-                super(EnhancedTrainer, self).__init__(*args, **kwargs)
-                if custom_loss_fn:
-                    self.loss_fn = custom_loss_fn
-                
-            def _train_epoch(self, epoch):
-                """Enhanced training epoch with gradient clipping."""
-                self.model.train()
-                total_loss = 0.0
-                num_batches = len(self.train_loader)
-                
-                # Get gradient clipping value
-                grad_clip_val = getattr(self.config, 'gradient_clip_val', None)
-                
-                # Create progress bar
-                pbar = tqdm(self.train_loader, desc=f"Training (Epoch {epoch+1}/{self.config.epochs})")
-                
-                for batch_idx, batch in enumerate(pbar):
-                    try:
-                        # Handle both tuple and dictionary batch formats
-                        if isinstance(batch, tuple) and len(batch) == 2:
-                            images, targets = batch
-                        elif isinstance(batch, dict):
-                            images = batch['image']
-                            targets = batch['target']
-                        else:
-                            raise ValueError(f"Unexpected batch format: {type(batch)}")
-                        
-                        # Move data to device
-                        images = [img.to(self.device) for img in images]
-                        targets = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                                for k, v in t.items()} for t in targets]
-                        
-                        # Check for mixed precision training
-                        use_amp = getattr(self.config, 'mixed_precision', False)
-                        
-                        if use_amp and hasattr(torch.cuda, 'amp'):
-                            # Use automatic mixed precision
-                            from torch.cuda.amp import autocast, GradScaler
-                            scaler = GradScaler()
-                            
-                            # Forward pass with autocast
-                            with autocast():
-                                loss_dict = self.model(images, targets)
-                                losses = sum(loss for loss in loss_dict.values())
-                            
-                            # Backward pass with scaler
-                            self.optimizer.zero_grad()
-                            scaler.scale(losses).backward()
-                            
-                            # Gradient clipping if enabled
-                            if grad_clip_val:
-                                scaler.unscale_(self.optimizer)
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_val)
-                            
-                            # Update weights with scaler
-                            scaler.step(self.optimizer)
-                            scaler.update()
-                        else:
-                            # Standard forward pass
-                            loss_dict = self.model(images, targets)
-                            losses = sum(loss for loss in loss_dict.values())
-                            
-                            # Backward pass
-                            self.optimizer.zero_grad()
-                            losses.backward()
-                            
-                            # Gradient clipping if enabled
-                            if grad_clip_val:
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_val)
-                            
-                            # Update weights
-                            self.optimizer.step()
-                        
-                        # Update progress bar
-                        total_loss += losses.item()
-                        pbar.set_postfix({
-                            'loss': losses.item(),
-                            'avg_loss': total_loss / (batch_idx + 1)
-                        })
-                        
-                        # Free memory
-                        del images, targets, loss_dict, losses
-                        if batch_idx % 5 == 0:
-                            empty_cache()
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error in batch {batch_idx} of epoch {epoch+1}: {e}")
-                        self.logger.error(traceback.format_exc())
-                        continue
-                
-                # Calculate average loss
-                avg_loss = total_loss / num_batches
-                self.logger.info(f"Epoch {epoch+1}/{self.config.epochs} - Average loss: {avg_loss:.4f}")
-                
-                return avg_loss
-        
         # Create trainer
-        trainer = EnhancedTrainer(
+        logger.info("Creating trainer")
+        trainer = Trainer(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
             config=training_config,
             device=device,
-            callbacks=callbacks,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            loss_fn=loss_fn
+            callbacks=callbacks
         )
         
         # Train model
-        logger.info("Starting training")
+        logger.info(f"Starting training for {training_config.epochs} epochs")
         start_time = time.time()
         training_summary = trainer.train(resume_from=args.resume)
         end_time = time.time()
@@ -554,7 +340,8 @@ def main():
         
         # Save training summary
         summary_path = os.path.join(training_config.log_dir, 'training_summary.json')
-        save_json(training_summary, summary_path)
+        with open(summary_path, 'w') as f:
+            json.dump(training_summary, f, indent=2)
         logger.info(f"Saved training summary to {summary_path}")
         
         return 0

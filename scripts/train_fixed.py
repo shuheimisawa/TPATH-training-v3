@@ -35,6 +35,10 @@ def parse_args():
                         help='Batch size for training')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--backbone', type=str, default='resnet50',
+                        help='Backbone model to use (resnet18, resnet34, resnet50, resnet101, resnet152)')
+    parser.add_argument('--cpu', action='store_true',
+                        help='Force CPU usage even if GPU is available')
     
     return parser.parse_args()
 
@@ -47,8 +51,8 @@ def create_safe_dataset(data_dir, mode, transform=None):
     except Exception as e:
         print(f"Error creating {mode} dataset: {e}")
         print(traceback.format_exc())
-        # Return empty dataset as fallback
-        return torch.utils.data.TensorDataset(torch.tensor([]))
+        # Create minimal dataset as fallback
+        return GlomeruliDataset(data_dir=data_dir, mode=mode, transform=transform)
 
 def main():
     # Parse arguments
@@ -67,11 +71,21 @@ def main():
         log_file=os.path.join(log_dir, "train.log")
     )
     
+    # Validate backbone name
+    valid_backbones = ['resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']
+    if args.backbone not in valid_backbones:
+        logger.warning(f"Invalid backbone name '{args.backbone}'. Must be one of {valid_backbones}")
+        logger.warning(f"Using default backbone: resnet50")
+        args.backbone = 'resnet50'
+    
     # Set device
-    if is_available():
+    if args.cpu:
+        device = torch.device("cpu")
+        logger.info("Forcing CPU usage")
+    elif is_available() and not args.cpu:
         device = get_dml_device()
         logger.info("Using DirectML device")
-    elif torch.cuda.is_available():
+    elif torch.cuda.is_available() and not args.cpu:
         device = torch.device("cuda:0")
         logger.info("Using CUDA device")
     else:
@@ -81,7 +95,7 @@ def main():
     try:
         # Create model config (simplified)
         model_config = ModelConfig()
-        model_config.backbone.name = 'resnet50'
+        model_config.backbone.name = args.backbone
         model_config.backbone.freeze_stages = 1
         model_config.fpn.num_outs = 4
         model_config.cascade.num_stages = 2  # Reduced for stability
@@ -98,6 +112,37 @@ def main():
         # Data paths
         train_dir = os.path.join(args.data_dir, 'train')
         val_dir = os.path.join(args.data_dir, 'val')
+        
+        # Check if data directories exist
+        if not os.path.exists(train_dir):
+            logger.warning(f"Training directory not found: {train_dir}")
+            # Try alternative paths
+            alternatives = [
+                'data/train',
+                'processed/train',
+                'data_test/processed/train',
+                '../data/train'
+            ]
+            for path in alternatives:
+                if os.path.exists(path):
+                    train_dir = path
+                    logger.info(f"Found alternative training path: {train_dir}")
+                    break
+        
+        if not os.path.exists(val_dir):
+            logger.warning(f"Validation directory not found: {val_dir}")
+            # Try alternative paths
+            alternatives = [
+                'data/val',
+                'processed/val',
+                'data_test/processed/val',
+                '../data/val'
+            ]
+            for path in alternatives:
+                if os.path.exists(path):
+                    val_dir = path
+                    logger.info(f"Found alternative validation path: {val_dir}")
+                    break
         
         logger.info(f"Using data directories: train={train_dir}, val={val_dir}")
         
@@ -124,9 +169,10 @@ def main():
         if len(val_dataset) == 0:
             logger.warning("Validation dataset is empty. Using a subset of training data for validation.")
             # Use a subset of training data for validation
-            train_size = int(0.8 * len(train_dataset))
-            val_size = len(train_dataset) - train_size
-            train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+            if len(train_dataset) > 1:
+                train_size = int(0.8 * len(train_dataset))
+                val_size = len(train_dataset) - train_size
+                train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
         
         # Create data loaders
         train_loader = DataLoader(
@@ -150,7 +196,7 @@ def main():
         )
         
         # Create model
-        logger.info("Creating model...")
+        logger.info(f"Creating model with backbone: {model_config.backbone.name}")
         model = CascadeMaskRCNN(model_config)
         model.to(device)
         
@@ -178,7 +224,7 @@ def main():
         )
         callbacks.append(early_stopping)
         
-        # Create trainer with a max iterations safeguard
+        # Create trainer
         trainer = Trainer(
             model=model,
             train_loader=train_loader,
@@ -188,88 +234,8 @@ def main():
             callbacks=callbacks
         )
         
-        # Monkey patch the _train_epoch method to add safety checks
-        import types
-        trainer._original_train_epoch = trainer._train_epoch
-        
-        def safe_train_epoch(self, epoch):
-            self.model.train()
-            
-            total_loss = 0.0
-            processed_batches = 0
-            max_batches = len(self.train_loader)  # Safety check
-            
-            epoch_iterator = tqdm(self.train_loader, desc=f"Training (Epoch {epoch+1})")
-            
-            for i, batch in enumerate(epoch_iterator):
-                # Safety check to prevent infinite loops
-                if processed_batches >= max_batches:
-                    self.logger.warning(f"Reached maximum number of batches ({max_batches}). Breaking loop.")
-                    break
-                    
-                try:
-                    # Process batch (simplified)
-                    images, targets = batch
-                    
-                    # Check for empty batch
-                    if not images or not targets:
-                        self.logger.warning(f"Empty batch at index {i}. Skipping.")
-                        continue
-                    
-                    # Move data to device
-                    images = [img.to(self.device) for img in images]
-                    targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
-                    
-                    # Zero gradients
-                    self.optimizer.zero_grad()
-                    
-                    # Forward pass
-                    losses = self.model(images, targets)
-                    
-                    # Calculate total loss
-                    if isinstance(losses, dict):
-                        loss = sum(loss for loss in losses.values() if isinstance(loss, torch.Tensor))
-                    else:
-                        loss = losses
-                    
-                    # Backward pass
-                    loss.backward()
-                    
-                    # Check for NaN loss
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        self.logger.error(f"NaN or Inf loss detected. Skipping batch.")
-                        continue
-                    
-                    # Update weights
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                    self.optimizer.step()
-                    
-                    total_loss += loss.item()
-                    processed_batches += 1
-                    
-                    # Update display
-                    epoch_iterator.set_postfix({
-                        'loss': loss.item(),
-                        'processed': f"{processed_batches}/{max_batches}"
-                    })
-                    
-                    # Clear memory every few batches
-                    if i % 5 == 0:
-                        empty_cache()
-                    
-                except Exception as e:
-                    self.logger.error(f"Error in batch {i}: {e}")
-                    self.logger.error(traceback.format_exc())
-                    continue
-            
-            avg_loss = total_loss / max(1, processed_batches)
-            self.logger.info(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}, Processed {processed_batches}/{max_batches} batches")
-            return avg_loss
-        
-        trainer._train_epoch = types.MethodType(safe_train_epoch, trainer)
-        
         # Start training
-        logger.info("Starting training...")
+        logger.info(f"Starting training for {args.epochs} epochs")
         training_summary = trainer.train(resume_from=args.resume)
         
         logger.info(f"Training completed. Best validation mAP: {training_summary['best_val_map']:.4f}")
