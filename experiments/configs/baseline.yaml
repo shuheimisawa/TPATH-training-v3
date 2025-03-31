@@ -1,13 +1,18 @@
-# Baseline configuration for Cascade Mask R-CNN model
+# experiments/configs/optimized.yaml
+# Optimized configuration for glomeruli segmentation model
 
 # Model configuration
 model:
   backbone:
-    name: 'resnet50'
+    name: 'resnet101'  # Deeper backbone for better feature extraction
     pretrained: true
-    freeze_stages: 1
+    freeze_stages: 1  # Freeze only first stage to allow fine-tuning
     norm_eval: true
     out_indices: [0, 1, 2, 3]
+  
+  use_bifpn: true  # Use BiFPN for better feature fusion
+  use_attention: true  # Use attention mechanisms
+  attention_type: 'cbam'  # CBAM attention provides both channel and spatial attention
   
   fpn:
     in_channels: [256, 512, 1024, 2048]
@@ -15,36 +20,38 @@ model:
     num_outs: 5
     add_extra_convs: true
     extra_convs_on_inputs: false
+    num_blocks: 3  # Number of BiFPN blocks
+    attention_type: 'cbam'  # Attention type for BiFPN
   
   rpn:
-    anchor_scales: [8, 16, 32]
-    anchor_ratios: [0.5, 1.0, 2.0]
+    anchor_scales: [4, 8, 16, 32, 64]  # More scales for better coverage
+    anchor_ratios: [0.5, 0.75, 1.0, 1.5, 2.0]  # More ratios for varied shapes
     anchor_strides: [4, 8, 16, 32, 64]
     target_means: [0.0, 0.0, 0.0, 0.0]
     target_stds: [1.0, 1.0, 1.0, 1.0]
     feat_channels: 256
     use_sigmoid_cls: true
-    nms_pre: 1000
-    nms_post: 1000
+    nms_pre: 2000
+    nms_post: 2000
     nms_thr: 0.7
     min_bbox_size: 0
-    num_max_proposals: 1000
+    num_max_proposals: 2000
   
   roi:
     roi_layer:
-      type: 'RoIAlign'
-      out_size: [5, 5]
+      type: 'RoIAlign'  # Better alignment than RoIPool
+      out_size: [7, 7]
       sample_num: 2
-    roi_size: [5, 5]
+    roi_size: [7, 7]
     roi_sample_num: 2
     target_means: [0.0, 0.0, 0.0, 0.0]
     target_stds: [0.1, 0.1, 0.2, 0.2]
     reg_class_agnostic: false
-    classes: 5  # background + 4 classes (Normal, Sclerotic, Partially_sclerotic, Uncertain)
+    classes: 5  # background + 4 classes
   
   cascade:
     num_stages: 3
-    stage_loss_weights: [1, 0.5, 0.25]
+    stage_loss_weights: [1.0, 0.5, 0.25]
     bbox_reg_weights: 
       - [10.0, 10.0, 5.0, 5.0]
       - [20.0, 20.0, 10.0, 10.0]
@@ -52,41 +59,54 @@ model:
     iou_thresholds: [0.5, 0.6, 0.7]
   
   mask:
-    roi_size: [10, 10]
+    roi_size: [28, 28]  # Increased from 14x14 for more detailed masks
     in_channels: 256
     conv_kernel_size: 1
-    classes: 5  # background + 4 classes (Normal, Sclerotic, Partially_sclerotic, Uncertain)
+    classes: 5  # background + 4 classes
   
-  num_classes: 5  # background + 4 classes (Normal, Sclerotic, Partially_sclerotic, Uncertain)
+  num_classes: 5  # background + 4 classes
   pretrained: null
 
 # Training configuration
 training:
   seed: 42
-  epochs: 12
-  batch_size: 1
-  workers: 2
+  epochs: 50  # More epochs for better convergence
+  batch_size: 2  # Adjust based on available GPU memory
+  workers: 4
   
   optimizer:
-    type: 'SGD'
-    lr: 0.005
-    momentum: 0.9
-    weight_decay: 0.0001
+    type: 'AdamW'  # Better optimizer with weight decay
+    lr: 0.0002  # Lower learning rate for AdamW
+    weight_decay: 0.01  # L2 regularization
   
   lr_scheduler:
-    type: 'multistep'
-    milestones: [8, 11]
-    gamma: 0.1
+    type: 'cosine'  # Cosine annealing for smoother decay
+    t_max: 50
+    eta_min: 0.00001  # Minimum learning rate
   
   data:
     dataset_type: 'GlomeruliDataset'
-    train_path: 'data_test/processed/train'
-    val_path: 'data_test/processed/val'
-    test_path: 'data_test/processed/test'
-    img_size: [512, 512]  # Reduced from 1024x1024 to 512x512 for better memory management
+    train_path: 'data/train'
+    val_path: 'data/val'
+    test_path: 'data/test'
+    img_size: [512, 512]  # Balanced size for memory and detail
     classes: ['Normal', 'Sclerotic', 'Partially_sclerotic', 'Uncertain']
     
-    # Data augmentation
+    # Class weights - Balance training to focus more on hard-to-detect classes
+    class_weights:
+      background: 1.0
+      Normal: 1.0
+      Sclerotic: 2.0         # Higher weight for challenging class
+      Partially_sclerotic: 1.5  # Medium weight for partially challenging class
+      Uncertain: 1.0
+    
+    # Stain normalization
+    use_stain_normalization: true
+    stain_normalization:
+      method: 'macenko'  # Macenko method works well for H&E stains
+      target_image_path: 'data/reference/reference_he.png'  # Path to reference image
+    
+    # Data augmentation - Enhanced for histopathology
     use_augmentation: true
     augmentations:
       horizontal_flip:
@@ -96,49 +116,63 @@ training:
       random_rotate_90:
         p: 0.5
       transpose:
-        p: 0.5
-      random_crop:
-        p: 0.5
-        size: [512, 512]
+        p: 0.3
       random_brightness_contrast:
         p: 0.5
         brightness_limit: 0.2
         contrast_limit: 0.2
       random_gamma:
-        p: 0.5
+        p: 0.3
         gamma_limit: [80, 120]
-      elastic_transform:
-        p: 0.5
-        alpha: 120.0
-        sigma: 6.0
+      hue_saturation_value:
+        p: 0.3
+        hue_shift_limit: 10
+        sat_shift_limit: 20
+        val_shift_limit: 10
+      elastic_transform:  # Important for histopathology
+        p: 0.3
+        alpha: 120
+        sigma: 12
         alpha_affine: 3.6
+      grid_distortion:
+        p: 0.2
+        distort_limit: 0.3
+      color_jitter:
+        p: 0.2
+        brightness: 0.1
+        contrast: 0.1
+        saturation: 0.1
+        hue: 0.1
     
-    # Normalization
+    # Normalization - After stain normalization
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
   
-  # Loss weights
-  rpn_cls_loss_weight: 1.0
-  rpn_bbox_loss_weight: 1.0
-  rcnn_cls_loss_weight: 1.0
-  rcnn_bbox_loss_weight: 1.0
-  mask_loss_weight: 1.0
+  # Enhanced loss function
+  loss:
+    use_enhanced_loss: true
+    rpn_cls_loss_weight: 1.0
+    rpn_bbox_loss_weight: 1.0
+    rcnn_cls_weight: 1.2      # Increased weight for classification
+    rcnn_bbox_weight: 1.0
+    mask_loss_weight: 1.5     # Increased weight for masks
+    focal_tversky_weight: 0.7  # Weight for Focal Tversky component
+    boundary_weight: 0.3      # Weight for boundary awareness
   
   # Checkpointing and logging
-  checkpoint_dir: 'experiments/checkpoints'
-  log_dir: 'experiments/logs'
+  checkpoint_dir: 'experiments/checkpoints/optimized'
+  log_dir: 'experiments/logs/optimized'
   save_freq: 1
   eval_freq: 1
   log_freq: 10
   
+  # Performance optimization
+  mixed_precision: true  # Use mixed precision training
+  gradient_clip_val: 5.0  # Clip gradients to prevent explosion
+  
   # Distributed training
   distributed: false
   gpu_ids: [0]
-  
-  # Memory optimization
-  pin_memory: true
-  prefetch_factor: 2
-  persistent_workers: true
   
   # Debugging
   debug: false
